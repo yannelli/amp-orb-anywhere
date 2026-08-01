@@ -29,15 +29,15 @@
 
 ## Introduction
 
-When you want Amp to keep working on a machine you control, a self-hosted runner is a persistent `amp --no-tui` process on that host. Amp Orb Anywhere provisions an Ubuntu 24.04 Lightsail VM (or any similar Ubuntu 24.04 box), installs a development toolchain, and manages one or more of those runners under systemd.
+A self-hosted Amp runner is a persistent `amp --no-tui` process on a machine you control. Amp Orb Anywhere provisions an Ubuntu 24.04 Lightsail VM (or a similar Ubuntu 24.04 host), installs a development toolchain, and manages one or more of those runners under systemd.
 
-This repository is setup tooling for **self-hosted Amp runners**. It is not Amp Orbs. Orbs, orb portals, orb OIDC, and orb webhooks are separate Amp product features. Do not expect orb lifecycle hooks such as `.agents/setup` or `.amp/services.yaml` to drive these runners.
+This repository is setup tooling for self-hosted Amp runners. Amp Orbs, orb portals, orb OIDC, and orb webhooks are separate product features. Do not expect orb lifecycle hooks such as `.agents/setup` or `.amp/services.yaml` to drive these runners.
 
 Checked against the Amp manual and Amp CLI `0.0.1785549193-gbb3f33` on 2026-08-01. Amp changes quickly. Confirm current flags and auth flow in the [Owner's Manual](https://ampcode.com/manual) before you rely on a command documented here.
 
 ## Requirements
 
-- Fresh **Ubuntu 24.04** instance (Lightsail is the primary target)
+- Fresh Ubuntu 24.04 instance (Lightsail is the primary target)
 - Root via `sudo`
 - Outbound HTTPS, DNS, and WebSocket access (Amp, Git hosts, package registries)
 - A non-root admin account for host-mode runners (`ubuntu` on Lightsail, or set `AMP_RUNNER_ADMIN_USER`)
@@ -81,7 +81,7 @@ Runtime pins for bootstrap and the Docker image:
 
 ### Cloud-init
 
-[`cloud-init.yaml`](cloud-init.yaml) prepares a fresh instance without embedding credentials. Set the repository URL (already pointed at this project by default), branch, and admin user before pasting it into Lightsail's launch script field. It runs a non-interactive host bootstrap. Amp and Tailscale login stay for the first SSH session:
+[`cloud-init.yaml`](cloud-init.yaml) prepares a fresh instance without embedding credentials. Set the repository URL (defaults to this project), branch, and admin user before pasting it into Lightsail's launch script field. It runs a non-interactive host bootstrap. Finish Amp and Tailscale login on first SSH:
 
 ```bash
 sudo amp-runner-setup add
@@ -148,11 +148,11 @@ Delete the source token file after setup. The installed copy lives under `/etc/a
 | `worktree` | Trusted concurrent work on one repository | Separate Git worktree only | Host access if the account is in `docker` | Every worktree runner uses the same Unix identity and Git object database. It is not a security boundary. |
 | `devcontainer` | A project that already defines its toolchain in `devcontainer.json` | Whatever the project configuration provides | Controlled by `devcontainer.json` | Lifecycle commands are trusted code. `privileged`, host mounts, and Docker socket mounts can give host access. |
 
-Use `host` on a VM dedicated to one trusted project. Use `docker` without `--docker-access socket` when runners on the same VM should not read each other's files. Use separate VMs for hostile repositories, separate trust domains, or credentials that must not be reachable by another runner. Linux containers are weaker isolation than a VM.
+Pick `host` for one trusted project on a dedicated VM. Pick `docker` without `--docker-access socket` when co-located runners must not read each other's files. Put hostile repositories, separate trust domains, or mutually unreachable credentials on separate VMs. A Linux container shares the host kernel; it is weaker isolation than a VM.
 
-The generic Docker image ships a broad development toolchain. The service container drops all capabilities and enables `no-new-privileges`, so its `amp` user cannot elevate with sudo at runtime. Rebuild the image to add OS packages. Docker-based project builds fail unless you opt into the host socket or configure a separate remote builder.
+The generic Docker image includes a broad development toolchain. The service container drops all capabilities and sets `no-new-privileges`, so the `amp` user cannot elevate with sudo at runtime. Rebuild the image to add OS packages. In-container Docker builds need `--docker-access socket` or a separate remote builder.
 
-Dev-container mode uses the project's `.devcontainer/devcontainer.json` or `.devcontainer.json`. It mounts a named volume at `/amp-runner-home`, installs Amp there, and reuses it across container rebuilds. The setup tool does not rewrite project configuration or override its security settings.
+Dev-container mode uses the project's `.devcontainer/devcontainer.json` or `.devcontainer.json`. It mounts a named volume at `/amp-runner-home`, installs Amp there, and reuses that home across rebuilds. The setup tool does not rewrite project configuration or change the project's security settings.
 
 ## Authentication and Projects
 
@@ -160,25 +160,25 @@ Interactive authentication runs `amp login`. On an SSH host it prints a URL for 
 
 The selection screen is populated by `amp projects list --json`. A selected project's `repositoryURL` becomes the checkout's `origin`. `amp projects status --json` then matches the project by that remote. There is no runner-level project flag for `amp --no-tui`. The `--project` CLI option applies to `--orb-execute`, not the persistent runner command.
 
-Amp authentication and Git-host authentication are separate. `amp clone namespace/name` covers Amp-hosted repositories. The setup offers `gh auth login` for GitHub repositories. Other private Git hosts need SSH keys, a credential helper, or another Git-supported credential mechanism in the runner identity.
+Amp authentication and Git-host authentication are separate. `amp clone namespace/name` covers Amp-hosted repositories. The setup offers `gh auth login` for GitHub. Other private Git hosts need SSH keys, a credential helper, or another Git credential mechanism on the runner identity.
 
-Dev-container interactive setup can prompt for Amp login twice. The host login lists projects before a repository and its `devcontainer.json` exist. The second login is stored in the dev-container home volume and authenticates the runner. GitHub CLI and SSH behavior inside a project dev container depend on that project's configuration; put credentials in `/amp-runner-home` if the runner must push from the container.
+Dev-container interactive setup can prompt for Amp login twice. The host login lists projects before a repository and its `devcontainer.json` exist. The second login is stored in the dev-container home volume for the runner process. GitHub CLI and SSH inside a project dev container follow that project's configuration. Put push credentials in `/amp-runner-home` when the runner must push from the container.
 
-Interactive credentials are stored by Amp in the runner's persistent home. On Linux Amp currently uses `~/.local/share/amp/secrets.json`. A container's home is a named Docker volume. Token mode stores the token under `/etc/amp-runner/secrets` and passes it to Amp at process start. Commands launched by Amp can share its process environment, so use a dedicated, revocable token and assume the agent can act with that identity.
+Interactive credentials are stored by Amp in the runner's persistent home. On Linux Amp currently uses `~/.local/share/amp/secrets.json`. A container's home is a named Docker volume. Token mode stores the token under `/etc/amp-runner/secrets` and passes it to Amp at process start. Child commands can inherit that environment. Use a dedicated, revocable token and treat the agent as that identity.
 
 ## Runner Behavior
 
-A self-hosted runner is a persistent Amp CLI process. It is not an Amp orb.
+A self-hosted runner is a persistent Amp CLI process under your systemd unit. Orb-only features do not apply to it.
 
 - The service command is `amp --no-tui --runner-id ID`. Runner IDs are stable lowercase DNS labels in this tool.
-- `--remote-control-terminal` is opt-in because it grants terminal access to users who can control the thread.
-- Threads use the runner's current checkout. They do not receive a fresh clone or a fresh machine.
-- Amp project, workspace, and personal secrets configured for orbs are not automatically injected into this VM.
-- `.agents/setup`, `.agents/resume`, `.amp/services.yaml`, orb portals, orb OIDC, and orb webhooks are orb features. Do not rely on them for runner lifecycle management.
-- Project plugins in `.amp/plugins/*.ts` load from the checkout. System plugins under `~/.config/amp/plugins/*.ts` persist in the runner home. Plugins execute trusted code with the same access as Amp.
-- OAuth MCP servers can require an interactive callback and persistent token storage. Test each server in the chosen mode. The Amp manual currently calls out an OAuth limitation for orbs, not self-hosted runners.
+- `--remote-control-terminal` is opt-in. It grants terminal access to users who can control the thread.
+- Threads use the runner's current checkout. They do not get a fresh clone or a fresh machine.
+- Amp project, workspace, and personal secrets configured for orbs are not injected into this VM.
+- `.agents/setup`, `.agents/resume`, `.amp/services.yaml`, orb portals, orb OIDC, and orb webhooks manage orbs. Do not rely on them for runner lifecycle.
+- Project plugins in `.amp/plugins/*.ts` load from the checkout. System plugins under `~/.config/amp/plugins/*.ts` persist in the runner home. Plugins run with the same access as Amp.
+- OAuth MCP servers can require an interactive callback and persistent token storage. Test each server in the chosen mode. The Amp manual currently documents an OAuth limitation for orbs; self-hosted runners are a different surface.
 
-The agent executes tools without approval by default. Use an Amp policy plugin or permissions configuration for repositories that need command restrictions. A policy running inside the same account is a guardrail, not protection from malicious code that already has host execution.
+The agent executes tools without approval by default. Use an Amp policy plugin or permissions configuration when a repository needs command restrictions. A policy in the same account only constrains willing tools. It does not stop malicious code that already has host execution.
 
 ## Operations
 
@@ -194,9 +194,9 @@ sudo amp-runner-setup remove build-1
 sudo amp-runner-setup remove build-1 --purge
 ```
 
-Each runner has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, and a 45-second stop timeout. Logs go to journald. `doctor` checks required tools, memory, disk, and every service. Amp has no documented runner readiness endpoint, so these are process checks and do not prove the runner is registered with Amp's service. Amp's default `amp.updates.mode` is `auto`; `amp-runner-setup update` forces CLI updates, rebuilds the generic container image, and restarts selected services.
+Each runner has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, and a 45-second stop timeout. Logs go to journald. `doctor` checks required tools, memory, disk, and every service. Amp has no documented runner readiness endpoint, so these checks only prove the process is up. They do not prove registration with Amp's service. Amp's default `amp.updates.mode` is `auto`. `amp-runner-setup update` forces CLI updates, rebuilds the generic container image, and restarts selected services.
 
-`remove` keeps workspaces and Docker home volumes by default. Retained home volumes contain Amp and Git-host credentials. `--purge` deletes them. `uninstall` removes services and this tool but leaves installed OS packages in place.
+`remove` keeps workspaces and Docker home volumes by default. Retained home volumes contain Amp and Git-host credentials. `--purge` deletes them. `uninstall` removes services and this tool. Installed OS packages stay.
 
 ### Persistent Paths
 
@@ -222,9 +222,9 @@ Current public IPv4 Linux bundle prices on 2026-08-01 from the [Lightsail pricin
 | Two to four container runners | 4 vCPU, 16 GB RAM, 320 GB disk | $84/month |
 | CPU-heavy builds | 4 vCPU, 8 GB RAM, 320 GB disk | $84/month compute optimized |
 
-The 1 GB and 2 GB plans are too small for the installed image and ordinary agent workloads. Concurrent compiler, browser, and language-server processes can use several gigabytes each. Watch memory, disk, Docker build cache, and inode use. Prefer a larger bundle over swap for sustained builds. A small 2 to 4 GB swap file can absorb short spikes; severe swap pressure makes the runner unresponsive.
+The 1 GB and 2 GB plans are too small for the installed image and ordinary agent workloads. Concurrent compiler, browser, and language-server processes can use several gigabytes each. Watch memory, disk, Docker build cache, and inode use. Prefer a larger bundle over swap for sustained builds. A 2 to 4 GB swap file can absorb short spikes. Heavy swap pressure makes the runner unresponsive.
 
-Lightsail instances continue billing while stopped. Snapshots and attached disks have separate charges. The static IPv4 address is free while attached to a running instance and is not required by Amp, because the runner opens outbound connections.
+Lightsail instances continue billing while stopped. Snapshots and attached disks have separate charges. A static IPv4 address is free while attached to a running instance. Amp does not require one; the runner dials out.
 
 ## Networking and SSH
 
