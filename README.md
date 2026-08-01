@@ -1,7 +1,7 @@
 # Amp Orb Anywhere
 
 <p align="center">
-    <img src="art/banner.png" alt="Amp Orb Anywhere: self-hosted Amp runners on Lightsail." width="720">
+    <img src="art/banner.png" alt="Amp Orb Anywhere: keep Amp running on infrastructure you control." width="720">
 </p>
 
 [![GitHub last commit](https://img.shields.io/github/last-commit/yannelli/amp-orb-anywhere.svg?style=flat-square)](https://github.com/yannelli/amp-orb-anywhere/commits/master)
