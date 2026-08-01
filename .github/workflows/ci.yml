@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install test tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq shellcheck
+      - name: Run repository tests
+        run: ./tests/test.sh
+      - name: Run ShellCheck
+        run: shellcheck setup.sh scripts/*.sh tests/test.sh

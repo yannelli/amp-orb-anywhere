@@ -15,6 +15,7 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 	exit 1
 fi
 
+# shellcheck disable=SC1091
 . /etc/os-release
 if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
 	printf 'Ubuntu 24.04 is required, found %s %s\n' "$ID" "$VERSION_ID" >&2
@@ -24,7 +25,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
-	apt-transport-https bash-completion ca-certificates curl wget gnupg dirmngr sudo \
+	apt-transport-https bash-completion ca-certificates curl wget gnupg dirmngr openssl sudo util-linux \
 	git git-lfs openssh-client jq rsync zip unzip p7zip-full xz-utils zstd \
 	build-essential autoconf automake libtool pkg-config cmake ninja-build \
 	gcc g++ clang clangd gdb lldb make \

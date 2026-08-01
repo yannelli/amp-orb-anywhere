@@ -1,0 +1,15 @@
+FROM lscr.io/linuxserver/webtop:debian-xfce
+
+USER root
+
+RUN apt-get update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends firefox-esr \
+	&& for directory in /usr/share/applications /usr/local/share/applications; do \
+		[ ! -d "$directory" ] || find "$directory" -maxdepth 1 -type f -name '*.desktop' \
+			! -name 'chromium.desktop' \
+			! -name 'firefox-esr.desktop' \
+			! -name 'xfce4-terminal.desktop' \
+			! -name 'Thunar.desktop' \
+			-exec sh -c 'printf "\nNoDisplay=true\n" >> "$1"' _ {} \;; \
+	done \
+	&& rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

@@ -4,6 +4,9 @@ set -euo pipefail
 NODE_MAJOR="${NODE_MAJOR:-24}"
 GO_VERSION="${GO_VERSION:-latest}"
 RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-stable}"
+TARGET="${1:-all}"
+
+case "$TARGET" in all | browser) ;; *) printf 'Usage: %s [all|browser]\n' "$0" >&2; exit 2 ;; esac
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 	printf 'install-runtimes.sh must run as root\n' >&2
@@ -100,8 +103,36 @@ install_rust() {
 	done
 }
 
+install_agent_browser() {
+	npm install --global agent-browser@latest
+	ln -sfn "$(npm prefix --global)/bin/agent-browser" /usr/local/bin/agent-browser
+	if [[ "$machine" != x86_64 ]]; then
+		printf 'agent-browser installed without Chrome for Testing, which is unavailable for %s\n' "$machine"
+		return
+	fi
+	install -d -m 0755 /opt/agent-browser
+	HOME=/opt/agent-browser agent-browser install --with-deps
+	chown -R root:root /opt/agent-browser
+	chmod -R a+rX /opt/agent-browser
+	local chrome
+	chrome="$(find /opt/agent-browser/.agent-browser/browsers -mindepth 2 -maxdepth 2 -type f -name chrome -perm /111 -print | sort -V | tail -n1)"
+	[[ -n "$chrome" ]] || {
+		printf 'agent-browser did not install Chrome for Testing\n' >&2
+		exit 1
+	}
+	ln -sfn "$chrome" /usr/local/bin/agent-browser-chrome
+}
+
+if [[ "$TARGET" == browser ]]; then
+	install_agent_browser
+	printf 'agent-browser %s installed\n' "$(agent-browser --version)"
+	exit 0
+fi
+
 install_node
 install_go
 install_rust
+install_agent_browser
 
-printf 'Node %s, %s, and Rust %s installed\n' "$(node --version)" "$(go version | awk '{print $3}')" "$(rustc --version | awk '{print $2}')"
+printf 'Node %s, %s, Rust %s, and agent-browser %s installed\n' \
+	"$(node --version)" "$(go version | awk '{print $3}')" "$(rustc --version | awk '{print $2}')" "$(agent-browser --version)"
