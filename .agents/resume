@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v docker >/dev/null 2>&1 && ! systemctl is-active --quiet docker; then
+	printf 'Starting Docker Engine\n'
+	sudo systemctl start docker
+fi
+
+printf 'Orb services ready\n'
