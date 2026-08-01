@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Amp Orb Anywhere icon</title>
+  <desc id="desc">A red angular orbit surrounding a geometric A gate, with a detached node.</desc>
+  <defs>
+    <filter id="grain" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.78" numOctaves="3" seed="19"/>
+      <feColorMatrix type="saturate" values="0"/>
+      <feComponentTransfer>
+        <feFuncA type="table" tableValues="0 0.035"/>
+      </feComponentTransfer>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#090909"/>
+
+  <!-- Open octagonal orbit -->
+  <path d="M720 245 512 125 304 245 188 452 188 572 304 779 512 899 720 779 836 572"
+        fill="none" stroke="#ff1717" stroke-width="68" stroke-linecap="square" stroke-linejoin="miter"/>
+
+  <!-- Geometric A gate -->
+  <path d="M350 704 512 350 674 704"
+        fill="none" stroke="#ff1717" stroke-width="72" stroke-linecap="square" stroke-linejoin="miter"/>
+  <path d="M420 608H604"
+        fill="none" stroke="#ff1717" stroke-width="64" stroke-linecap="square"/>
+
+  <!-- Runner node closes the implied orbit without touching it -->
+  <rect x="788" y="370" width="76" height="76" fill="#ff1717" transform="rotate(30 826 408)"/>
+
+  <rect width="1024" height="1024" filter="url(#grain)" opacity="0.75"/>
+</svg>

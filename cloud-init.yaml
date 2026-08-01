@@ -14,9 +14,9 @@ write_files:
     owner: root:root
     permissions: '0600'
     content: |
-      SETUP_REPOSITORY_URL=https://github.com/OWNER/REPOSITORY.git
-      SETUP_SUBDIRECTORY=amp-runner
-      SETUP_REF=main
+      SETUP_REPOSITORY_URL=https://github.com/yannelli/amp-orb-anywhere.git
+      SETUP_SUBDIRECTORY=.
+      SETUP_REF=master
       ADMIN_USER=ubuntu
 
   - path: /usr/local/sbin/bootstrap-amp-runner
@@ -32,7 +32,7 @@ write_files:
       }
       rm -rf /opt/amp-runner-source
       git clone --depth 1 --branch "$SETUP_REF" "$SETUP_REPOSITORY_URL" /opt/amp-runner-source
-      cd "/opt/amp-runner-source/$SETUP_SUBDIRECTORY"
+      cd "/opt/amp-runner-source/${SETUP_SUBDIRECTORY}"
       chmod +x setup.sh scripts/*.sh
       AMP_RUNNER_ADMIN_USER="$ADMIN_USER" ./setup.sh bootstrap --non-interactive
 

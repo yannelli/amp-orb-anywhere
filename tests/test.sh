@@ -81,7 +81,10 @@ else
 	pass 'devcontainer token avoids process arguments'
 fi
 
-if grep -R $'\u2014' "$ROOT" --include='*.md' --include='*.sh' >/dev/null; then
+# Match UTF-8 em dash (U+2014). Avoid $'\u2014' so macOS Bash 3.2 does not
+# treat the escape sequence as a literal search string for this file.
+em_dash="$(printf '\342\200\224')"
+if grep -R "$em_dash" "$ROOT" --include='*.md' --include='*.sh' >/dev/null; then
 	fail 'prose contains em dash'
 else
 	pass 'prose punctuation check'
