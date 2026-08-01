@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/yannelli/amp-orb-anywhere/compare/v1.1.0...v1.1.1) (2026-08-01)
+
+
+### Bug Fixes
+
+* keep crashed agent services restarting ([3f5881b](https://github.com/yannelli/amp-orb-anywhere/commit/3f5881ba99925ee0f25b5740b8847c481b2b7f82))
+
 ## [1.1.0](https://github.com/yannelli/amp-orb-anywhere/compare/v1.0.0...v1.1.0) (2026-08-01)
 
 
