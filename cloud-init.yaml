@@ -1,0 +1,44 @@
+#cloud-config
+# Replace SETUP_REPOSITORY_URL and SETUP_SUBDIRECTORY before use.
+# Keep access tokens and private keys out of cloud-init user data.
+
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+
+write_files:
+  - path: /etc/amp-runner-bootstrap.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      SETUP_REPOSITORY_URL=https://github.com/OWNER/REPOSITORY.git
+      SETUP_SUBDIRECTORY=amp-runner
+      SETUP_REF=main
+      ADMIN_USER=ubuntu
+
+  - path: /usr/local/sbin/bootstrap-amp-runner
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      . /etc/amp-runner-bootstrap.conf
+      [[ "$SETUP_REPOSITORY_URL" != *OWNER/REPOSITORY* ]] || {
+        printf 'Set SETUP_REPOSITORY_URL in /etc/amp-runner-bootstrap.conf\n' >&2
+        exit 1
+      }
+      rm -rf /opt/amp-runner-source
+      git clone --depth 1 --branch "$SETUP_REF" "$SETUP_REPOSITORY_URL" /opt/amp-runner-source
+      cd "/opt/amp-runner-source/$SETUP_SUBDIRECTORY"
+      chmod +x setup.sh scripts/*.sh
+      AMP_RUNNER_ADMIN_USER="$ADMIN_USER" ./setup.sh bootstrap --non-interactive
+
+runcmd:
+  - [bash, -lc, '/usr/local/sbin/bootstrap-amp-runner']
+
+final_message: >-
+  Amp runner host bootstrap finished after $UPTIME seconds.
+  SSH in and run: sudo amp-runner-setup add
