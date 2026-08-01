@@ -335,7 +335,9 @@ sudo amp-runner-setup remove build-1
 sudo amp-runner-setup remove build-1 --purge
 ```
 
-Each workspace has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, and a 45-second stop timeout. Amp units run the persistent runner. Codex and Claude units run their native Remote Control server when enabled, or hold an idle container when disabled. Logs go to journald. `doctor` checks required tools, memory, disk, and every service. Amp has no documented runner readiness endpoint, so these checks only prove the process is up. They do not prove registration with Amp's service. `amp-runner-setup update` resolves the latest Codex and Claude releases, rebuilds the generic image, updates Amp, and restarts selected services.
+Each workspace has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, no restart-attempt limit, and a 45-second stop timeout. Amp runs as the unit's main process. Claude Remote Control runs as the container's foreground process. The Codex supervisor checks its daemon PID every 30 seconds. A process or container exit therefore causes systemd to recreate the workspace indefinitely, including after repeated crashes. An explicit `systemctl stop` still keeps it stopped. Logs go to journald.
+
+This is crash supervision, not an end-to-end liveness probe. Amp, Codex, and Claude do not expose a stable local health endpoint that proves the agent can reach its provider and process work. A process that remains alive but is internally stuck is not restarted automatically. `doctor` checks required tools, memory, disk, and every service, but only proves that the process is up. For Amp it does not prove registration with Amp's service. `amp-runner-setup update` resolves the latest Codex and Claude releases, rebuilds the generic image, updates Amp, and restarts selected services.
 
 `remove` keeps workspaces and Docker home volumes by default. Retained home volumes contain Amp and Git-host credentials. `--purge` deletes them. `uninstall` removes services and this tool. Installed OS packages stay.
 

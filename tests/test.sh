@@ -164,6 +164,14 @@ else
 	fail 'container hardening defaults'
 fi
 
+unit_definition="$(declare -f write_unit)"
+if grep -q 'Restart=always' <<< "$unit_definition" && grep -q 'RestartSec=5s' <<< "$unit_definition" && \
+	grep -q 'StartLimitIntervalSec=0' <<< "$unit_definition" && grep -q 'checks its daemon PID every 30 seconds' "$ROOT/README.md"; then
+	pass 'agent crash supervision retries indefinitely'
+else
+	fail 'agent crash supervision retries indefinitely'
+fi
+
 if ! grep -q 'NOPASSWD' "$ROOT/Dockerfile" && grep -q -- '--env HOME=/agent-home' "$ROOT/setup.sh" && \
 	grep -q 'docker inspect.*State.Running' "$ROOT/setup.sh" && grep -q 'Interactive.*login skipped without a terminal' "$ROOT/setup.sh"; then
 	pass 'provider runtime avoids root escalation and waits for persistent workspace readiness'

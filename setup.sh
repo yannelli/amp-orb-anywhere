@@ -1255,6 +1255,7 @@ Description=$agent agent workspace $id ($mode)
 After=network-online.target docker.service
 Wants=network-online.target
 $([[ "$mode" == docker || "$mode" == devcontainer ]] && printf 'Requires=docker.service')
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
