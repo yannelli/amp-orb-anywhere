@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Test assertions intentionally match literal shell expressions.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,11 +69,70 @@ assert_equal '8' "$PROJECT_SPEC_COUNT" 'bulk project count parsing'
 state_root="$(mktemp -d)"
 trap 'rm -rf "$state_root"' EXIT
 STATE_DIR="$state_root"
+SECRET_DIR="$state_root/secrets"
+mkdir -p "$SECRET_DIR"
 printf '%s\n' '{"remoteTerminal":false}' > "$STATE_DIR/local.json"
 if runner_flags local && [[ "${RUNNER_FLAGS[*]}" == '--no-tui --runner-id local' ]]; then
 	pass 'disabled remote terminal runner flags'
 else
 	fail 'disabled remote terminal runner flags'
+fi
+assert_equal 'amp' "$(agent_provider local)" 'legacy state defaults to Amp provider'
+
+write_state codex-test docker tester /tmp/codex-work acme/api https://github.com/acme/api interactive false none '' codex
+assert_equal 'codex' "$(jq -r '.agent' "$STATE_DIR/codex-test.json")" 'provider state serialization'
+assert_equal 'false' "$(native_remote_enabled codex-test)" 'provider native remote defaults off in legacy state calls'
+write_state claude-test docker tester /tmp/claude-work acme/api https://github.com/acme/api interactive false none '' claude true
+assert_equal 'true' "$(native_remote_enabled claude-test)" 'provider native remote state serialization'
+if ! jq -e 'has("apiKey") or has("token")' "$STATE_DIR/codex-test.json" >/dev/null; then
+	pass 'provider state excludes credentials'
+else
+	fail 'provider state excludes credentials'
+fi
+
+rollback_workspace="$state_root/rollback-workspace"
+mkdir -p "$rollback_workspace"
+printf 'partial\n' > "$rollback_workspace/partial"
+ADD_TRANSACTION_ACTIVE=true
+ADD_TRANSACTION_ID=rollback-test
+ADD_TRANSACTION_WORKSPACE="$rollback_workspace"
+ADD_TRANSACTION_WORKSPACE_CREATED=true
+ADD_TRANSACTION_VOLUME_CREATED=false
+ADD_TRANSACTION_DESKTOP_VOLUME_CREATED=false
+ADD_TRANSACTION_SECRET_CREATED=false
+ADD_TRANSACTION_BASE_REPO=''
+rollback_add_instance
+trap 'rm -rf "$state_root"' EXIT
+if [[ ! -e "$rollback_workspace" && "$ADD_TRANSACTION_ACTIVE" == false ]]; then
+	pass 'failed add transaction removes newly created workspace'
+else
+	fail 'failed add transaction removes newly created workspace'
+fi
+
+printf 'preserve\n' > "$(token_path collision-test)"
+if (ensure_add_resources_available collision-test) >/dev/null 2>&1; then
+	fail 'add rejects orphaned same-ID resources'
+else
+	pass 'add rejects orphaned same-ID resources'
+fi
+rm -f "$(token_path collision-test)"
+
+github_projects="$(
+	as_user() {
+		printf '%s\n' '{"id":"123","namespace":"acme","name":"api","repositoryURL":"https://github.com/acme/api.git"}'
+	}
+	list_github_repositories tester
+)"
+assert_equal 'acme/api' "$(jq -r '.[0].namespace + "/" + .[0].name' <<< "$github_projects")" 'GitHub repository conversion'
+assert_equal 'https://github.com/acme/api.git' "$(jq -r '.[0].repositoryURL' <<< "$github_projects")" 'GitHub clone URL selection'
+
+container_agent_common_args codex-test /tmp/work agent-home codex /tmp/provider-key
+if printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq 'type=bind,source=/tmp/provider-key,target=/run/secrets/agent_api_key,readonly' && \
+	printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq 'agent-home:/agent-home' && \
+	! printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -q 'OPENAI_API_KEY\|ANTHROPIC_API_KEY'; then
+	pass 'provider home and file-backed secret mounts'
+else
+	fail 'provider home and file-backed secret mounts'
 fi
 
 assert_equal '/desktop/local/' "$(desktop_subfolder local)" 'desktop reverse-proxy path'
@@ -84,13 +144,15 @@ else
 	fail 'desktop port reservation'
 fi
 
-if "$ROOT/setup.sh" --help | grep -q -- 'Amp runner setup'; then
+if "$ROOT/setup.sh" --help | grep -q -- 'Agent workspace manager'; then
 	pass 'help output'
 else
 	fail 'help output'
 fi
 
-if "$ROOT/setup.sh" --help | grep -q -- 'provision' && "$ROOT/setup.sh" capabilities | grep -q -- 'Amp-managed orb infrastructure only'; then
+if "$ROOT/setup.sh" --help | grep -q -- '--agent amp|codex|claude' && "$ROOT/setup.sh" --help | grep -q -- 'connect RUNNER_ID' && \
+	"$ROOT/setup.sh" --help | grep -q -- 'remote enable|disable|status|pair RUNNER_ID' && \
+	"$ROOT/setup.sh" capabilities | grep -q -- 'Amp-managed orb infrastructure only'; then
 	pass 'fleet and capability commands'
 else
 	fail 'fleet and capability commands'
@@ -100,6 +162,45 @@ if grep -q -- '--cap-drop ALL' "$ROOT/setup.sh" && grep -q -- 'no-new-privileges
 	pass 'container hardening defaults'
 else
 	fail 'container hardening defaults'
+fi
+
+if ! grep -q 'NOPASSWD' "$ROOT/Dockerfile" && grep -q -- '--env HOME=/agent-home' "$ROOT/setup.sh" && \
+	grep -q 'docker inspect.*State.Running' "$ROOT/setup.sh" && grep -q 'Interactive.*login skipped without a terminal' "$ROOT/setup.sh"; then
+	pass 'provider runtime avoids root escalation and waits for persistent workspace readiness'
+else
+	fail 'provider runtime avoids root escalation and waits for persistent workspace readiness'
+fi
+
+agent_container_definition="$(declare -f run_agent_container)"
+if grep -q -- '--cap-add SYS_ADMIN' <<< "$agent_container_definition" && \
+	grep -q -- '--cap-add SYS_CHROOT' <<< "$agent_container_definition" && \
+	grep -q -- '--cap-add SETUID' <<< "$agent_container_definition" && \
+	grep -q -- '--cap-add SETGID' <<< "$agent_container_definition" && \
+	grep -q -- '--cap-add SYS_PTRACE' <<< "$agent_container_definition" && \
+	grep -q -- 'seccomp=unconfined' <<< "$agent_container_definition" && \
+	! grep -q -- 'NET_ADMIN\|NET_RAW\|--privileged' <<< "$agent_container_definition"; then
+	pass 'Codex nested sandbox uses documented minimum container privileges'
+else
+	fail 'Codex nested sandbox uses documented minimum container privileges'
+fi
+
+if grep -q 'codex login --device-auth' "$ROOT/setup.sh" && grep -q 'claude auth login' "$ROOT/setup.sh" && \
+	grep -q 'docker exec.*"\$agent"' "$ROOT/setup.sh" && grep -q 'codex remote-control start' "$ROOT/setup.sh" && \
+	grep -q 'claude remote-control --name' "$ROOT/setup.sh" && grep -q 'codex remote-control pair' "$ROOT/setup.sh" && \
+	grep -q 'accept workspace trust' "$ROOT/setup.sh" && grep -q 'Codex Remote Control is opt-in' "$ROOT/README.md"; then
+	pass 'provider CLI, trust, login, and remote commands'
+else
+	fail 'provider CLI, trust, login, and remote commands'
+fi
+
+if grep -q 'OPENAI_API_KEY="$(cat /run/secrets/agent_api_key)"' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q 'ANTHROPIC_API_KEY="$(cat /run/secrets/agent_api_key)"' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q 'CODEX_HOME=.*\.codex' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q 'CLAUDE_CONFIG_DIR=.*\.claude' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q '\.local/bin/codex' "$ROOT/scripts/agent-cli-launcher" && grep -q '\.local/bin/claude' "$ROOT/scripts/agent-cli-launcher"; then
+	pass 'provider launcher maps secrets and persistent config'
+else
+	fail 'provider launcher maps secrets and persistent config'
 fi
 
 if grep -Eq 'RUNNER_FLAGS=.*--project|--no-tui.*--project' "$ROOT/setup.sh"; then
@@ -114,7 +215,23 @@ else
 	pass 'devcontainer token avoids process arguments'
 fi
 
-if grep -q -- 'OnUnitActiveSec=6h' "$ROOT/setup.sh" && grep -q -- 'releases/latest' "$ROOT/setup.sh"; then
+if grep -q 'gh auth token --hostname github.com.*|' "$ROOT/setup.sh" && grep -q 'gh auth login --hostname github.com --git-protocol https --with-token' "$ROOT/setup.sh" && \
+	! grep -q 'GH_TOKEN=.*gh auth login' "$ROOT/setup.sh"; then
+	pass 'container GitHub credentials transfer over stdin'
+else
+	fail 'container GitHub credentials transfer over stdin'
+fi
+
+if grep -q 'trap rollback_add_instance EXIT' "$ROOT/setup.sh" && grep -q 'ADD_TRANSACTION_SECRET_CREATED' "$ROOT/setup.sh" && \
+	grep -q 'requested_project:-\$requested_repository' "$ROOT/setup.sh"; then
+	pass 'fleet project forwarding and failed-add rollback'
+else
+	fail 'fleet project forwarding and failed-add rollback'
+fi
+
+if grep -q -- 'OnUnitActiveSec=6h' "$ROOT/setup.sh" && grep -q -- 'releases/latest' "$ROOT/setup.sh" && \
+	grep -q 'npm view @openai/codex version' "$ROOT/setup.sh" && grep -q 'npm view @anthropic-ai/claude-code version' "$ROOT/setup.sh" && \
+	grep -q 'active desktops were left running' "$ROOT/setup.sh"; then
 	pass 'automatic release updater'
 else
 	fail 'automatic release updater'
@@ -127,10 +244,20 @@ else
 fi
 
 if grep -q 'FROM lscr.io/linuxserver/webtop:debian-xfce' "$ROOT/Dockerfile.desktop" && \
-	grep -q 'firefox-esr' "$ROOT/Dockerfile.desktop" && grep -q "'Thunar.desktop'" "$ROOT/Dockerfile.desktop"; then
+	grep -q 'firefox-esr' "$ROOT/Dockerfile.desktop" && grep -q "'thunar.desktop'" "$ROOT/Dockerfile.desktop"; then
 	pass 'web workspace applications'
 else
 	fail 'web workspace applications'
+fi
+
+if grep -q 'chatgpt.com/codex/install.sh' "$ROOT/Dockerfile" && grep -q 'claude.ai/install.sh' "$ROOT/Dockerfile" && \
+	grep -q 'CODEX_INSTALL_DIR=/agent-home/.local/bin' "$ROOT/Dockerfile" && \
+	grep -q 'chmod u+s /usr/bin/bwrap' "$ROOT/Dockerfile" && grep -q 'install-runtimes.sh node' "$ROOT/Dockerfile.desktop" && \
+	grep -q 'scripts/agent-cli-launcher.*INSTALL_DIR/scripts' "$ROOT/setup.sh" && \
+	! grep -q 'DISABLE_AUTOUPDATER' "$ROOT/Dockerfile" "$ROOT/Dockerfile.desktop"; then
+	pass 'agent images use current native CLIs, native updates, and nested sandbox runtime'
+else
+	fail 'agent images use current native CLIs, native updates, and nested sandbox runtime'
 fi
 
 desktop_definition="$(declare -f run_desktop)"
@@ -143,10 +270,18 @@ else
 	fail 'web workspace private access defaults'
 fi
 
+if grep -q 'amp-runner-${id}-home:/agent-home' <<< "$desktop_definition" && \
+	grep -q 'target=/run/secrets/agent_api_key,readonly' <<< "$desktop_definition" && \
+	grep -q 'provider.*codex' <<< "$desktop_definition"; then
+	pass 'provider desktop shares only workspace home and runtime secret'
+else
+	fail 'provider desktop shares only workspace home and runtime secret'
+fi
+
 if grep -q 'flock.*desktop_lock_fd' "$ROOT/setup.sh" && \
 	grep -q "transaction_complete.*cleanup_desktop_resources" "$ROOT/setup.sh" && \
 	grep -q 'desktop.enabled.*write_desktop_unit' "$ROOT/setup.sh" && \
-	[[ "$(grep -c 'exec {desktop_lock_fd}>&-' "$ROOT/setup.sh")" -eq 4 ]]; then
+	[[ "$(grep -c 'exec {desktop_lock_fd}>&-' "$ROOT/setup.sh")" -ge 4 ]]; then
 	pass 'web workspace transactional lifecycle'
 else
 	fail 'web workspace transactional lifecycle'

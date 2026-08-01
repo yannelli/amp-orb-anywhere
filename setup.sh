@@ -13,6 +13,16 @@ UPDATE_REPOSITORY="${AMP_RUNNER_UPDATE_REPOSITORY:-yannelli/amp-orb-anywhere}"
 AUTO_UPDATE_TIMER='amp-runner-update.timer'
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SOURCE_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+ADD_TRANSACTION_ACTIVE=false
+ADD_TRANSACTION_ID=''
+ADD_TRANSACTION_WORKSPACE=''
+ADD_TRANSACTION_WORKSPACE_CREATED=false
+ADD_TRANSACTION_VOLUME_CREATED=false
+ADD_TRANSACTION_DESKTOP_VOLUME_CREATED=false
+ADD_TRANSACTION_SECRET_CREATED=false
+ADD_TRANSACTION_BASE_REPO=''
+ADD_TRANSACTION_USER=''
+PROVISION_TEMP_TOKEN_FILE=''
 
 say() {
 	printf '%s\n' "$*"
@@ -153,6 +163,69 @@ desktop_state_value() {
 	jq -r --arg default "$default" "($query) // \$default" "$(state_file "$id")"
 }
 
+agent_provider() {
+	jq -r '.agent // "amp"' "$(state_file "$1")"
+}
+
+native_remote_enabled() {
+	jq -r '.nativeRemote // false' "$(state_file "$1")"
+}
+
+ensure_add_resources_available() {
+	local id="$1" path
+	for path in \
+		"$(token_path "$id")" \
+		"$(desktop_username_path "$id")" \
+		"$(desktop_password_path "$id")" \
+		"/etc/systemd/system/$(service_name "$id").service" \
+		"/etc/systemd/system/$(desktop_service_name "$id").service"; do
+		[[ ! -e "$path" ]] || die "Runner ID $id has orphaned resources at $path. Remove or rename them before retrying."
+	done
+	if docker container inspect "amp-runner-$id" >/dev/null 2>&1 || docker container inspect "$(desktop_service_name "$id")" >/dev/null 2>&1; then
+		die "Runner ID $id has an orphaned Docker container. Remove or rename it before retrying."
+	fi
+	if docker network inspect "amp-runner-$id" >/dev/null 2>&1; then
+		die "Runner ID $id has an orphaned Docker network. Remove or rename it before retrying."
+	fi
+}
+
+rollback_add_instance() {
+	[[ "$ADD_TRANSACTION_ACTIVE" == true ]] || return 0
+	trap - EXIT INT TERM HUP
+	local id="$ADD_TRANSACTION_ID"
+	systemctl disable --now "$(desktop_service_name "$id").service" >/dev/null 2>&1 || true
+	systemctl disable --now "$(service_name "$id").service" >/dev/null 2>&1 || true
+	docker rm --force "$(desktop_service_name "$id")" "amp-runner-$id" >/dev/null 2>&1 || true
+	docker network rm "amp-runner-$id" >/dev/null 2>&1 || true
+	rm -f "/etc/systemd/system/$(desktop_service_name "$id").service" "/etc/systemd/system/$(service_name "$id").service"
+	rm -f "$(desktop_username_path "$id")" "$(desktop_password_path "$id")"
+	if [[ "$ADD_TRANSACTION_SECRET_CREATED" == true ]]; then rm -f "$(token_path "$id")"; fi
+	if [[ "$ADD_TRANSACTION_VOLUME_CREATED" == true ]]; then
+		docker volume rm "amp-runner-${id}-home" >/dev/null 2>&1 || true
+	fi
+	if [[ "$ADD_TRANSACTION_DESKTOP_VOLUME_CREATED" == true ]]; then
+		docker volume rm "amp-runner-${id}-desktop" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$ADD_TRANSACTION_BASE_REPO" && -e "$ADD_TRANSACTION_WORKSPACE" ]]; then
+		as_user "$ADD_TRANSACTION_USER" git -C "$ADD_TRANSACTION_BASE_REPO" worktree remove --force "$ADD_TRANSACTION_WORKSPACE" >/dev/null 2>&1 || true
+	elif [[ "$ADD_TRANSACTION_WORKSPACE_CREATED" == true ]]; then
+		rm -rf -- "$ADD_TRANSACTION_WORKSPACE"
+	fi
+	rm -f "$(state_file "$id")"
+	if [[ -n "$PROVISION_TEMP_TOKEN_FILE" ]]; then rm -f -- "$PROVISION_TEMP_TOKEN_FILE"; fi
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	ADD_TRANSACTION_ACTIVE=false
+}
+
+restore_provision_exit_trap() {
+	if [[ -n "$PROVISION_TEMP_TOKEN_FILE" ]]; then
+		trap 'rm -f -- "$PROVISION_TEMP_TOKEN_FILE"' EXIT
+	else
+		trap - EXIT
+	fi
+	trap - INT TERM HUP
+}
+
 desktop_service_name() {
 	printf 'amp-runner-%s-desktop' "$1"
 }
@@ -209,9 +282,9 @@ install_tool_files() {
 		install -m 0644 "$source/Dockerfile" "$INSTALL_DIR/Dockerfile"
 		install -m 0644 "$source/Dockerfile.desktop" "$INSTALL_DIR/Dockerfile.desktop"
 		install -d -m 0755 "$INSTALL_DIR/scripts"
-		install -m 0755 "$source"/scripts/*.sh "$INSTALL_DIR/scripts/"
+		install -m 0755 "$source"/scripts/*.sh "$source/scripts/agent-cli-launcher" "$INSTALL_DIR/scripts/"
 	else
-		chmod 0755 "$INSTALL_DIR/setup.sh" "$INSTALL_DIR"/scripts/*.sh
+		chmod 0755 "$INSTALL_DIR/setup.sh" "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR/scripts/agent-cli-launcher"
 	fi
 	ln -sfn "$INSTALL_DIR/setup.sh" /usr/local/sbin/amp-runner-setup
 }
@@ -319,11 +392,23 @@ install_tailscale() {
 }
 
 build_image() {
-	docker build --pull --tag "$IMAGE" "$INSTALL_DIR"
+	local codex_version claude_version
+	codex_version="$(npm view @openai/codex version)"
+	claude_version="$(npm view @anthropic-ai/claude-code version)"
+	docker build --pull \
+		--build-arg "CODEX_VERSION=$codex_version" \
+		--build-arg "CLAUDE_CODE_VERSION=$claude_version" \
+		--tag "$IMAGE" "$INSTALL_DIR"
 }
 
 build_desktop_image() {
-	docker build --pull --file "$INSTALL_DIR/Dockerfile.desktop" --tag "$DESKTOP_IMAGE" "$INSTALL_DIR"
+	local codex_version claude_version
+	codex_version="$(npm view @openai/codex version)"
+	claude_version="$(npm view @anthropic-ai/claude-code version)"
+	docker build --pull \
+		--build-arg "CODEX_VERSION=$codex_version" \
+		--build-arg "CLAUDE_CODE_VERSION=$claude_version" \
+		--file "$INSTALL_DIR/Dockerfile.desktop" --tag "$DESKTOP_IMAGE" "$INSTALL_DIR"
 }
 
 desktop_enabled() {
@@ -396,7 +481,7 @@ write_desktop_unit() {
 	service="$(desktop_service_name "$id")"
 	cat > "/etc/systemd/system/$service.service" <<EOF
 [Unit]
-Description=Secure web workspace for Amp runner $id
+Description=Secure web workspace for agent $id
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
@@ -422,11 +507,13 @@ EOF
 }
 
 run_desktop() {
-	local id="$1" workspace mode user uid gid port access name subfolder='/'
+	local id="$1" workspace mode user uid gid port access name provider key='' subfolder='/'
+	local -a args
 	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
 	desktop_enabled "$id" || die "Web workspace is disabled for runner $id."
 	workspace="$(state_value "$id" '.workspace')"
 	mode="$(state_value "$id" '.mode')"
+	provider="$(agent_provider "$id")"
 	user="$(state_value "$id" '.user')"
 	if [[ "$mode" == docker ]]; then
 		uid=1000
@@ -441,29 +528,42 @@ run_desktop() {
 	[[ "$access" != tailscale ]] || subfolder="$(desktop_subfolder "$id")"
 	name="$(desktop_service_name "$id")"
 	docker rm --force "$name" >/dev/null 2>&1 || true
-	exec docker run --rm \
-		--name "$name" \
-		--label "amp.runner.id=$id" \
-		--label 'amp.runner.component=desktop' \
-		--publish "127.0.0.1:$port:3001" \
-		--volume "amp-runner-${id}-desktop:/config" \
-		--volume "$workspace:/workspace:rw" \
-		--mount "type=bind,source=$(desktop_username_path "$id"),target=/run/secrets/webtop_username,readonly" \
-		--mount "type=bind,source=$(desktop_password_path "$id"),target=/run/secrets/webtop_password,readonly" \
-		--env "PUID=$uid" \
-		--env "PGID=$gid" \
-		--env 'TZ=Etc/UTC' \
-		--env "TITLE=Amp Workspace: $id" \
-		--env "SUBFOLDER=$subfolder" \
-		--env 'FILE_MANAGER_PATH=/workspace' \
-		--env 'FILE__CUSTOM_USER=/run/secrets/webtop_username' \
-		--env 'FILE__PASSWORD=/run/secrets/webtop_password' \
-		--env 'DISABLE_SUDO=true' \
-		--env 'START_DOCKER=false' \
-		--shm-size 1g \
-		--pids-limit 4096 \
-		--security-opt no-new-privileges:true \
-		"$DESKTOP_IMAGE"
+	args=(--rm
+		--name "$name"
+		--label "amp.runner.id=$id"
+		--label 'amp.runner.component=desktop'
+		--label "amp.agent.provider=$provider"
+		--publish "127.0.0.1:$port:3001"
+		--volume "amp-runner-${id}-desktop:/config"
+		--volume "$workspace:/workspace:rw"
+		--mount "type=bind,source=$(desktop_username_path "$id"),target=/run/secrets/webtop_username,readonly"
+		--mount "type=bind,source=$(desktop_password_path "$id"),target=/run/secrets/webtop_password,readonly"
+		--env "PUID=$uid"
+		--env "PGID=$gid"
+		--env 'TZ=Etc/UTC'
+		--env "TITLE=$provider Workspace: $id"
+		--env "SUBFOLDER=$subfolder"
+		--env 'FILE_MANAGER_PATH=/workspace'
+		--env 'FILE__CUSTOM_USER=/run/secrets/webtop_username'
+		--env 'FILE__PASSWORD=/run/secrets/webtop_password'
+		--env 'DISABLE_SUDO=true'
+		--env 'START_DOCKER=false'
+		--shm-size 1g
+		--pids-limit 4096)
+	if [[ "$provider" != amp ]]; then
+		args+=(--volume "amp-runner-${id}-home:/agent-home")
+		if [[ "$(state_value "$id" '.auth')" == token ]]; then
+			key="$(token_path "$id")"
+			args+=(--mount "type=bind,source=$key,target=/run/secrets/agent_api_key,readonly")
+		fi
+	fi
+	if [[ "$provider" == codex ]]; then
+		args+=(--cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SETUID --cap-add SETGID --cap-add SYS_PTRACE
+			--security-opt seccomp=unconfined --security-opt apparmor=unconfined)
+	else
+		args+=(--security-opt no-new-privileges:true)
+	fi
+	exec docker run "${args[@]}" "$DESKTOP_IMAGE"
 }
 
 stop_desktop() {
@@ -699,7 +799,8 @@ rotate_desktop_password() {
 
 update_desktops() {
 	require_root desktop-update
-	local target="${1:---all}" file id found=false desktop_lock_fd
+	local target="${1:---all}" file id found=false desktop_lock_fd old_image='' new_image
+	local force_restart="${AMP_RUNNER_FORCE_RESTART:-true}"
 	for file in "$STATE_DIR"/*.json; do
 		[[ -e "$file" ]] || continue
 		id="$(jq -r '.id' "$file")"
@@ -709,7 +810,15 @@ update_desktops() {
 	[[ "$found" == true ]] || { say 'No enabled web workspaces matched.'; return; }
 	exec {desktop_lock_fd}> "$CONFIG_DIR/desktop.lock"
 	flock "$desktop_lock_fd"
+	old_image="$(docker image inspect --format '{{.Id}}' "$DESKTOP_IMAGE" 2>/dev/null || true)"
 	build_desktop_image
+	new_image="$(docker image inspect --format '{{.Id}}' "$DESKTOP_IMAGE")"
+	if [[ "$force_restart" != true && "$old_image" == "$new_image" ]]; then
+		flock -u "$desktop_lock_fd"
+		exec {desktop_lock_fd}>&-
+		say 'Web workspace image is current; active desktops were left running.'
+		return
+	fi
 	for file in "$STATE_DIR"/*.json; do
 		[[ -e "$file" ]] || continue
 		id="$(jq -r '.id' "$file")"
@@ -799,9 +908,9 @@ token_path() {
 }
 
 store_token() {
-	local id="$1" token="$2" owner="${3:-root}"
-	[[ -n "$token" ]] || die 'The Amp access token is empty.'
-	[[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] || die 'The Amp access token contains a newline.'
+	local id="$1" token="$2" owner="${3:-root}" provider="${4:-amp}"
+	[[ -n "$token" ]] || die "The $provider API key is empty."
+	[[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] || die "The $provider API key contains a newline."
 	local path
 	path="$(token_path "$id")"
 	(
@@ -819,6 +928,22 @@ container_common_args() {
 		CONTAINER_ARGS+=(--mount "type=bind,source=$key,target=/run/secrets/amp_api_key,readonly")
 	fi
 	CONTAINER_ARGS+=(--label "amp.runner.id=$id")
+}
+
+container_agent_common_args() {
+	local id="$1" workspace="$2" home_volume="$3" provider="$4" key="$5"
+	CONTAINER_ARGS=(--rm --volume "$home_volume:/agent-home" --volume "$workspace:/workspace" --workdir /workspace)
+	CONTAINER_ARGS+=(--label "amp.runner.id=$id" --label "amp.agent.provider=$provider")
+	if [[ -n "$key" ]]; then
+		CONTAINER_ARGS+=(--mount "type=bind,source=$key,target=/run/secrets/agent_api_key,readonly")
+	fi
+}
+
+container_agent_interactive() {
+	local id="$1" workspace="$2" home_volume="$3" provider="$4"
+	shift 4
+	container_agent_common_args "$id" "$workspace" "$home_volume" "$provider" ''
+	docker run --interactive --tty "${CONTAINER_ARGS[@]}" "$IMAGE" "$provider" "$@"
 }
 
 container_amp() {
@@ -868,17 +993,50 @@ list_projects_container() {
 	container_amp "$id" "$workspace" "$volume" "$key" projects list --json
 }
 
+ensure_github_login() {
+	local user="$1"
+	if as_user "$user" gh auth status --hostname github.com >/dev/null 2>&1; then return; fi
+	have_tty || die 'GitHub CLI login is required to discover repositories.'
+	as_user "$user" gh auth login --hostname github.com --git-protocol https --web
+	as_user "$user" gh auth setup-git --hostname github.com
+}
+
+list_github_repositories() {
+	local user="$1"
+	as_user "$user" gh api --paginate \
+		'user/repos?per_page=100&affiliation=owner,collaborator,organization_member&sort=full_name' \
+		--jq '.[] | {id:(.id|tostring),namespace:.owner.login,name:.name,repositoryURL:.clone_url}' |
+		jq -s 'unique_by(.repositoryURL) | sort_by(.namespace, .name)'
+}
+
+authenticate_agent_container() {
+	local provider="$1" id="$2" workspace="$3" volume="$4" auth="$5"
+	[[ "$auth" == interactive ]] || return 0
+	if ! have_tty; then
+		say "Interactive $provider login skipped without a terminal. Run: sudo amp-runner-setup authenticate $id"
+		return 0
+	fi
+	case "$provider" in
+	codex) container_agent_interactive "$id" "$workspace" "$volume" codex login --device-auth ;;
+	claude)
+		container_agent_interactive "$id" "$workspace" "$volume" claude auth login
+		say 'Claude will open once so you can accept workspace trust. Exit Claude after accepting.'
+		container_agent_interactive "$id" "$workspace" "$volume" claude
+		;;
+	esac
+}
+
 choose_project() {
 	local projects_json="$1" requested="${2:-}" selected
 	if [[ -n "$requested" ]]; then
 		selected="$(jq -c --arg ref "$requested" '.[] | select((.namespace + "/" + .name) == $ref or .id == $ref or .repositoryURL == $ref)' <<< "$projects_json" | head -n1)"
-		[[ -n "$selected" ]] || die "Amp project not found: $requested"
+		[[ -n "$selected" ]] || die "Project or repository not found: $requested"
 		printf '%s\n' "$selected"
 		return
 	fi
 	mapfile -t PROJECT_OPTIONS < <(jq -r '.[] | (.namespace + "/" + .name + "\t" + .repositoryURL)' <<< "$projects_json")
-	((${#PROJECT_OPTIONS[@]} > 0)) || die 'No Amp projects are available to this account.'
-	selected="$(ui_choose 'Amp project' "${PROJECT_OPTIONS[@]}")"
+	((${#PROJECT_OPTIONS[@]} > 0)) || die 'No projects or repositories are available to this account.'
+	selected="$(ui_choose 'Project or repository' "${PROJECT_OPTIONS[@]}")"
 	local ref="${selected%%$'\t'*}"
 	jq -c --arg ref "$ref" '.[] | select((.namespace + "/" + .name) == $ref)' <<< "$projects_json" | head -n1
 }
@@ -904,14 +1062,25 @@ ensure_host_github_auth() {
 }
 
 ensure_container_github_auth() {
-	local id="$1" workspace="$2" volume="$3" remote="$4"
+	local provider="$1" id="$2" workspace="$3" volume="$4" remote="$5" host_user="${6:-}"
 	[[ "$remote" == *github.com* ]] || return 0
-	container_common_args "$id" "$workspace" "$volume" ''
+	if [[ "$provider" == amp ]]; then
+		container_common_args "$id" "$workspace" "$volume" ''
+	else
+		container_agent_common_args "$id" "$workspace" "$volume" "$provider" ''
+		CONTAINER_ARGS+=(--env HOME=/agent-home)
+	fi
 	if docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth status --hostname github.com >/dev/null 2>&1; then
+		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth setup-git --hostname github.com
+	elif [[ -n "$host_user" ]] && as_user "$host_user" gh auth status --hostname github.com >/dev/null 2>&1; then
+		as_user "$host_user" gh auth token --hostname github.com | \
+			docker run --interactive "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth login --hostname github.com --git-protocol https --with-token
 		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth setup-git --hostname github.com
 	elif have_tty && ui_confirm 'Authenticate GitHub CLI in this container for private clone and push access?' yes; then
 		docker run --interactive --tty "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth login --hostname github.com --git-protocol https --web
 		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth setup-git --hostname github.com
+	else
+		die "GitHub authentication is required inside workspace $id to clone $remote."
 	fi
 }
 
@@ -941,10 +1110,18 @@ prepare_host_checkout() {
 }
 
 prepare_container_checkout() {
-	local id="$1" workspace="$2" volume="$3" key="$4" project_ref="$5" remote="$6" clone_repo="$7"
+	local id="$1" workspace="$2" volume="$3" key="$4" project_ref="$5" remote="$6" clone_repo="$7" provider="${8:-amp}" host_user="${9:-}"
+	local -a checkout_args
 	install -d -m 0755 "$(dirname "$workspace")"
+	if [[ "$provider" == amp ]]; then
+		container_common_args "$id" "$workspace" "$volume" "$key"
+	else
+		container_agent_common_args "$id" "$workspace" "$volume" "$provider" "$key"
+		CONTAINER_ARGS+=(--env HOME=/agent-home)
+	fi
+	checkout_args=("${CONTAINER_ARGS[@]}")
 	if [[ -d "$workspace/.git" || -f "$workspace/.git" ]]; then
-		docker run --rm --volume "$workspace:/workspace" --workdir /workspace "$IMAGE" git remote set-url origin "$remote"
+		docker run "${checkout_args[@]}" "$IMAGE" git remote set-url origin "$remote"
 		return
 	fi
 	[[ ! -e "$workspace" || -z "$(find "$workspace" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] || die "Workspace is not empty: $workspace"
@@ -958,13 +1135,18 @@ prepare_container_checkout() {
 		if [[ "$remote" == https://ampcode.com/git/* ]]; then
 			container_amp "$id" "$(dirname "$workspace")" "$volume" "$key" clone "$project_ref" "/workspace/$(basename "$workspace")"
 		else
-			ensure_container_github_auth "$id" "$(dirname "$workspace")" "$volume" "$remote"
-			container_common_args "$id" "$(dirname "$workspace")" "$volume" ''
+			ensure_container_github_auth "$provider" "$id" "$(dirname "$workspace")" "$volume" "$remote" "$host_user"
+			if [[ "$provider" == amp ]]; then
+				container_common_args "$id" "$(dirname "$workspace")" "$volume" ''
+			else
+				container_agent_common_args "$id" "$(dirname "$workspace")" "$volume" "$provider" ''
+				CONTAINER_ARGS+=(--env HOME=/agent-home)
+			fi
 			docker run "${CONTAINER_ARGS[@]}" "$IMAGE" git clone "$remote" "$(basename "$workspace")"
 		fi
 	else
-		docker run --rm --volume "$workspace:/workspace" --workdir /workspace "$IMAGE" git init
-		docker run --rm --volume "$workspace:/workspace" --workdir /workspace "$IMAGE" git remote add origin "$remote"
+		docker run "${checkout_args[@]}" "$IMAGE" git init
+		docker run "${checkout_args[@]}" "$IMAGE" git remote add origin "$remote"
 	fi
 }
 
@@ -1050,26 +1232,26 @@ prepare_devcontainer_amp() {
 }
 
 write_state() {
-	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}"
+	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}" agent="${11:-amp}" native_remote="${12:-false}"
 	jq -n \
 		--arg id "$id" --arg mode "$mode" --arg user "$user" --arg workspace "$workspace" \
-		--arg project "$project_ref" --arg repositoryURL "$remote" --arg auth "$auth" \
+		--arg project "$project_ref" --arg repositoryURL "$remote" --arg auth "$auth" --arg agent "$agent" \
 		--arg service "$(service_name "$id")" --arg dockerAccess "$docker_access" \
-		--arg baseRepository "$base_repo" --argjson remoteTerminal "$remote_terminal" \
+		--arg baseRepository "$base_repo" --argjson remoteTerminal "$remote_terminal" --argjson nativeRemote "$native_remote" \
 		--arg createdAt "$(date --iso-8601=seconds)" \
-		'{id:$id,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
+		'{id:$id,agent:$agent,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,nativeRemote:$nativeRemote,desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
 		> "$(state_file "$id")"
 	chmod 0644 "$(state_file "$id")"
 }
 
 write_unit() {
-	local id="$1" mode="$2" user="$3" auth="$4" service unit_user='root' credential=''
+	local id="$1" mode="$2" user="$3" auth="$4" agent="${5:-amp}" service unit_user='root' credential=''
 	service="$(service_name "$id")"
 	[[ "$mode" == host || "$mode" == worktree || "$mode" == devcontainer ]] && unit_user="$user"
-	[[ "$auth" == token ]] && credential="LoadCredential=amp_api_key:$(token_path "$id")"
+	[[ "$agent" == amp && "$auth" == token ]] && credential="LoadCredential=amp_api_key:$(token_path "$id")"
 	cat > "/etc/systemd/system/$service.service" <<EOF
 [Unit]
-Description=Amp runner $id ($mode)
+Description=$agent agent workspace $id ($mode)
 After=network-online.target docker.service
 Wants=network-online.target
 $([[ "$mode" == docker || "$mode" == devcontainer ]] && printf 'Requires=docker.service')
@@ -1105,20 +1287,24 @@ add_instance() {
 	require_root add
 	[[ -f "$CONFIG_DIR/.bootstrapped" ]] || die 'Run sudo amp-runner-setup bootstrap first.'
 
-	local mode='' id='' auth='' token='' token_file='' requested_project='' workspace='' clone_repo='' remote_terminal='' docker_access='none'
+	local agent='' mode='' id='' auth='' token='' token_file='' requested_project='' requested_repository='' workspace='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
 	local desktop='' desktop_access=''
 	while (($#)); do
 		case "$1" in
+		--agent) agent="$2"; shift ;;
 		--mode) mode="$2"; shift ;;
 		--id) id="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
 		--token-file) token_file="$2"; shift ;;
 		--project) requested_project="$2"; shift ;;
+		--repository | --repo) requested_repository="$2"; shift ;;
 		--workspace) workspace="$2"; shift ;;
 		--clone) clone_repo=true ;;
 		--no-clone) clone_repo=false ;;
 		--remote-terminal) remote_terminal=true ;;
 		--no-remote-terminal) remote_terminal=false ;;
+		--native-remote) native_remote=true ;;
+		--no-native-remote) native_remote=false ;;
 		--desktop) desktop=true ;;
 		--no-desktop) desktop=false ;;
 		--desktop-access) desktop_access="$2"; shift ;;
@@ -1128,18 +1314,26 @@ add_instance() {
 		shift
 	done
 
-	ui_title 'Add Amp runner instance'
-	[[ -n "$mode" ]] || mode="$(ui_choose 'Instance type' 'host' 'docker' 'worktree' 'devcontainer')"
+	ui_title 'Add agent workspace'
+	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' 'amp' 'codex' 'claude')"
+	case "$agent" in amp | codex | claude) ;; *) die '--agent must be amp, codex, or claude.' ;; esac
+	if [[ "$agent" == amp ]]; then
+		[[ -n "$mode" ]] || mode="$(ui_choose 'Instance type' 'host' 'docker' 'worktree' 'devcontainer')"
+	else
+		[[ -n "$mode" ]] || mode=docker
+		[[ "$mode" == docker ]] || die 'Codex and Claude workspaces currently use Docker mode.'
+	fi
 	case "$mode" in host | docker | worktree | devcontainer) ;; *) die "Invalid mode: $mode" ;; esac
-	if [[ "$mode" == host ]] && find "$STATE_DIR" -name '*.json' -exec jq -e 'select(.mode == "host")' {} \; | grep -q .; then
+	if [[ "$agent" == amp && "$mode" == host ]] && find "$STATE_DIR" -name '*.json' -exec jq -e 'select((.agent // "amp") == "amp" and .mode == "host")' {} \; | grep -q .; then
 		die 'A dedicated host runner already exists. Use docker, worktree, or devcontainer for another instance.'
 	fi
-	[[ -n "$id" ]] || id="$(ui_input 'Stable runner ID' "$(hostname -s)-$mode")"
+	[[ -n "$id" ]] || id="$(ui_input 'Stable workspace ID' "$(hostname -s)-$agent-$mode")"
 	id="$(slugify "$id")"
 	validate_runner_id "$id" || die 'Runner ID must be one lowercase DNS label, up to 63 characters.'
 	[[ ! -e "$(state_file "$id")" ]] || die "Runner already exists: $id"
+	ensure_add_resources_available "$id"
 
-	[[ -n "$auth" ]] || auth="$(ui_choose 'Amp authentication' 'interactive' 'token')"
+	[[ -n "$auth" ]] || auth="$(ui_choose "$agent authentication" 'interactive' 'token')"
 	case "$auth" in interactive | token) ;; *) die "Invalid authentication method: $auth" ;; esac
 	if [[ "$auth" == token ]]; then
 		if [[ -n "$token_file" ]]; then
@@ -1147,7 +1341,7 @@ add_instance() {
 			token="$(cat "$token_file")"
 		else
 			have_tty || die '--token-file is required without a terminal.'
-			token="$(ui_password 'Amp access token')"
+			token="$(ui_password "$agent API key")"
 		fi
 	fi
 
@@ -1155,46 +1349,93 @@ add_instance() {
 	user="$(admin_user)"
 	[[ -n "$workspace" ]] || workspace="$DATA_DIR/workspaces/$id"
 	[[ "$workspace" == /* ]] || die 'Workspace must be an absolute path.'
+	ADD_TRANSACTION_ACTIVE=true
+	ADD_TRANSACTION_ID="$id"
+	ADD_TRANSACTION_WORKSPACE="$workspace"
+	ADD_TRANSACTION_WORKSPACE_CREATED=false
+	ADD_TRANSACTION_VOLUME_CREATED=false
+	ADD_TRANSACTION_DESKTOP_VOLUME_CREATED=false
+	ADD_TRANSACTION_SECRET_CREATED=false
+	ADD_TRANSACTION_BASE_REPO=''
+	ADD_TRANSACTION_USER="$user"
+	[[ -e "$workspace" ]] || ADD_TRANSACTION_WORKSPACE_CREATED=true
+	if [[ "$mode" == docker ]] && ! docker volume inspect "$volume" >/dev/null 2>&1; then ADD_TRANSACTION_VOLUME_CREATED=true; fi
+	if ! docker volume inspect "amp-runner-${id}-desktop" >/dev/null 2>&1; then ADD_TRANSACTION_DESKTOP_VOLUME_CREATED=true; fi
+	trap rollback_add_instance EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	trap 'exit 129' HUP
 	install -d -m 0755 "$workspace"
 
 	if [[ "$auth" == token ]]; then
 		local owner=root
 		[[ "$mode" == docker ]] && owner=1000
 		[[ "$mode" == devcontainer ]] && owner="$user"
-		store_token "$id" "$token" "$owner"
+		store_token "$id" "$token" "$owner" "$agent"
+		ADD_TRANSACTION_SECRET_CREATED=true
 		key="$(token_path "$id")"
 	fi
 
-	case "$mode" in
-	host | worktree)
-		authenticate_host "$user" "$auth" "$token"
-		projects_json="$(list_projects_host "$user" "$auth" "$token")"
-		;;
-	docker)
+	if [[ "$agent" == amp ]]; then
+		case "$mode" in
+		host | worktree)
+			authenticate_host "$user" "$auth" "$token"
+			projects_json="$(list_projects_host "$user" "$auth" "$token")"
+			;;
+		docker)
+			docker volume create "$volume" >/dev/null
+			chown 1000:1000 "$workspace"
+			authenticate_container "$id" "$workspace" "$volume" "$auth" "$key"
+			projects_json="$(list_projects_container "$id" "$workspace" "$volume" "$key")"
+			;;
+		devcontainer)
+			authenticate_host "$user" "$auth" "$token"
+			projects_json="$(list_projects_host "$user" "$auth" "$token")"
+			;;
+		esac
+	else
 		docker volume create "$volume" >/dev/null
 		chown 1000:1000 "$workspace"
-		authenticate_container "$id" "$workspace" "$volume" "$auth" "$key"
-		projects_json="$(list_projects_container "$id" "$workspace" "$volume" "$key")"
-		;;
-	devcontainer)
-		authenticate_host "$user" "$auth" "$token"
-		projects_json="$(list_projects_host "$user" "$auth" "$token")"
-		;;
-	esac
+		ensure_github_login "$user"
+		projects_json="$(list_github_repositories "$user")"
+	fi
 
-	project_json="$(choose_project "$projects_json" "$requested_project")"
+	if [[ "$agent" == amp ]]; then
+		project_json="$(choose_project "$projects_json" "${requested_project:-$requested_repository}")"
+	else
+		project_json="$(choose_project "$projects_json" "${requested_repository:-$requested_project}")"
+	fi
 	project_ref="$(jq -r '.namespace + "/" + .name' <<< "$project_json")"
 	remote="$(jq -r '.repositoryURL' <<< "$project_json")"
-	[[ -n "$remote" && "$remote" != null ]] || die "Project $project_ref has no repository URL. Configure one in Amp first."
+	[[ -n "$remote" && "$remote" != null ]] || die "Project $project_ref has no repository URL."
 	if [[ -z "$clone_repo" ]]; then
 		have_tty || die 'Pass --clone or --no-clone without a terminal.'
 		if ui_confirm "Clone $remote now?" yes; then clone_repo=true; else clone_repo=false; fi
 	fi
-	if [[ -z "$remote_terminal" ]]; then
+	if [[ "$agent" != amp ]]; then
+		remote_terminal=false
+	elif [[ -z "$remote_terminal" ]]; then
 		if have_tty && ui_confirm 'Enable web terminal access for remotely controlled threads?' no; then remote_terminal=true; else remote_terminal=false; fi
 	fi
+	if [[ "$agent" == amp ]]; then
+		[[ "$native_remote" != true ]] || die '--native-remote is for Codex and Claude workspaces.'
+		native_remote=false
+	elif [[ "$auth" == token ]]; then
+		[[ "$native_remote" != true ]] || die 'Native Remote Control requires provider account login; API keys are not supported.'
+		native_remote=false
+	elif [[ -z "$native_remote" ]]; then
+		if have_tty; then
+			local native_remote_default=yes
+			if [[ "$agent" == codex ]]; then native_remote_default=no; fi
+			if ui_confirm "Enable $agent native Remote Control?" "$native_remote_default"; then native_remote=true; else native_remote=false; fi
+		else
+			if [[ "$agent" == claude ]]; then native_remote=true; else native_remote=false; fi
+		fi
+	fi
 	if [[ -z "$desktop" ]]; then
-		if have_tty && ui_confirm 'Enable the secure web workspace with terminal, browsers, and files?' no; then desktop=true; else desktop=false; fi
+		local desktop_default=no
+		if [[ "$agent" != amp ]]; then desktop_default=yes; fi
+		if have_tty && ui_confirm 'Enable the secure web workspace with terminal, browsers, and files?' "$desktop_default"; then desktop=true; else desktop=false; fi
 	fi
 	if [[ "$desktop" == true && -z "$desktop_access" ]]; then
 		have_tty || die '--desktop-access tailscale or --desktop-access ssh is required with --desktop.'
@@ -1204,7 +1445,9 @@ add_instance() {
 		case "$desktop_access" in tailscale | ssh) ;; *) die '--desktop-access must be tailscale or ssh.' ;; esac
 	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
-	if [[ "$mode" == docker && "$docker_access" == none ]] && have_tty; then
+	if [[ "$agent" != amp && "$docker_access" != none ]]; then
+		die 'Docker socket access is not supported for Codex or Claude workspaces.'
+	elif [[ "$agent" == amp && "$mode" == docker && "$docker_access" == none ]] && have_tty; then
 		if ui_confirm 'Mount the host Docker socket? This gives the runner effective root access to the VM.' no; then docker_access=socket; fi
 	fi
 
@@ -1215,9 +1458,11 @@ add_instance() {
 		;;
 	worktree)
 		base_repo="$(prepare_worktree "$user" "$workspace" "$project_ref" "$remote" "$clone_repo")"
+		ADD_TRANSACTION_BASE_REPO="$base_repo"
 		;;
 	docker)
-		prepare_container_checkout "$id" "$workspace" "$volume" "$key" "$project_ref" "$remote" "$clone_repo"
+		prepare_container_checkout "$id" "$workspace" "$volume" "$key" "$project_ref" "$remote" "$clone_repo" "$agent" "$user"
+		if [[ "$agent" != amp ]]; then authenticate_agent_container "$agent" "$id" "$workspace" "$volume" "$auth"; fi
 		;;
 	devcontainer)
 		prepare_host_checkout "$user" "$workspace" "$project_ref" "$remote" "$clone_repo"
@@ -1233,13 +1478,17 @@ add_instance() {
 		;;
 	esac
 
-	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo"
-	write_unit "$id" "$mode" "$user" "$auth"
+	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo" "$agent" "$native_remote"
+	write_unit "$id" "$mode" "$user" "$auth" "$agent"
 	if [[ "$desktop" == true ]]; then enable_desktop "$id" --access "$desktop_access"; fi
+	ADD_TRANSACTION_ACTIVE=false
+	restore_provision_exit_trap
 	say
-	say "Runner $id is installed for $project_ref."
+	say "$agent workspace $id is installed for $project_ref."
 	say "Status: sudo amp-runner-setup status $id"
 	say "Logs:   sudo amp-runner-setup logs $id"
+	say "CLI:    sudo amp-runner-setup connect $id"
+	if [[ "$native_remote" == true ]]; then say "Remote: sudo amp-runner-setup remote status $id"; fi
 }
 
 parse_project_spec() {
@@ -1272,20 +1521,24 @@ next_runner_id() {
 provision_instances() {
 	require_root provision
 	[[ -f "$CONFIG_DIR/.bootstrapped" ]] || die 'Run sudo amp-runner-setup bootstrap first.'
+	PROVISION_TEMP_TOKEN_FILE=''
 
-	local mode='' auth='' token_file='' generated_token_file='' token='' clone_repo='' remote_terminal='' docker_access='none'
+	local agent='' mode='' auth='' token_file='' generated_token_file='' token='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
 	local desktop='' desktop_access=''
 	local -a requested_specs=()
 	while (($#)); do
 		case "$1" in
+		--agent) agent="$2"; shift ;;
 		--mode) mode="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
 		--token-file) token_file="$2"; shift ;;
-		--project) requested_specs+=("$2"); shift ;;
+		--project | --repository | --repo) requested_specs+=("$2"); shift ;;
 		--clone) clone_repo=true ;;
 		--no-clone) clone_repo=false ;;
 		--remote-terminal) remote_terminal=true ;;
 		--no-remote-terminal) remote_terminal=false ;;
+		--native-remote) native_remote=true ;;
+		--no-native-remote) native_remote=false ;;
 		--desktop) desktop=true ;;
 		--no-desktop) desktop=false ;;
 		--desktop-access) desktop_access="$2"; shift ;;
@@ -1295,10 +1548,17 @@ provision_instances() {
 		shift
 	done
 
-	ui_title 'Provision runner fleet'
-	[[ -n "$mode" ]] || mode="$(ui_choose 'Runtime isolation' 'docker' 'worktree' 'devcontainer' 'host')"
+	ui_title 'Provision agent fleet'
+	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' 'amp' 'codex' 'claude')"
+	case "$agent" in amp | codex | claude) ;; *) die '--agent must be amp, codex, or claude.' ;; esac
+	if [[ "$agent" == amp ]]; then
+		[[ -n "$mode" ]] || mode="$(ui_choose 'Runtime isolation' 'docker' 'worktree' 'devcontainer' 'host')"
+	else
+		[[ -n "$mode" ]] || mode=docker
+		[[ "$mode" == docker ]] || die 'Codex and Claude workspaces currently use Docker mode.'
+	fi
 	case "$mode" in host | docker | worktree | devcontainer) ;; *) die "Invalid mode: $mode" ;; esac
-	[[ -n "$auth" ]] || auth="$(ui_choose 'Amp authentication' 'token' 'interactive')"
+	[[ -n "$auth" ]] || auth="$(ui_choose "$agent authentication" 'token' 'interactive')"
 	case "$auth" in interactive | token) ;; *) die "Invalid authentication method: $auth" ;; esac
 	if [[ "$auth" == token ]]; then
 		if [[ -n "$token_file" ]]; then
@@ -1306,9 +1566,10 @@ provision_instances() {
 			token="$(cat "$token_file")"
 		else
 			have_tty || die '--token-file is required without a terminal.'
-			token="$(ui_password 'Amp access token')"
+			token="$(ui_password "$agent API key")"
 			token_file="$(mktemp)"
 			generated_token_file="$token_file"
+			PROVISION_TEMP_TOKEN_FILE="$token_file"
 			chmod 0600 "$token_file"
 			printf '%s' "$token" > "$token_file"
 			# Capture the path now because this local variable is gone when the EXIT trap runs.
@@ -1320,11 +1581,29 @@ provision_instances() {
 	[[ -n "$clone_repo" ]] || {
 		if have_tty && ui_confirm 'Clone every selected repository?' yes; then clone_repo=true; else clone_repo=false; fi
 	}
+	if [[ "$agent" != amp ]]; then remote_terminal=false; fi
 	[[ -n "$remote_terminal" ]] || {
 		if have_tty && ui_confirm 'Enable web terminal access for these runners?' no; then remote_terminal=true; else remote_terminal=false; fi
 	}
+	if [[ "$agent" == amp ]]; then
+		[[ "$native_remote" != true ]] || die '--native-remote is for Codex and Claude workspaces.'
+		native_remote=false
+	elif [[ "$auth" == token ]]; then
+		[[ "$native_remote" != true ]] || die 'Native Remote Control requires provider account login; API keys are not supported.'
+		native_remote=false
+	elif [[ -z "$native_remote" ]]; then
+		if have_tty; then
+			local native_remote_default=yes
+			if [[ "$agent" == codex ]]; then native_remote_default=no; fi
+			if ui_confirm "Enable $agent native Remote Control for every workspace?" "$native_remote_default"; then native_remote=true; else native_remote=false; fi
+		else
+			if [[ "$agent" == claude ]]; then native_remote=true; else native_remote=false; fi
+		fi
+	fi
 	[[ -n "$desktop" ]] || {
-		if have_tty && ui_confirm 'Enable secure web workspaces for these runners?' no; then desktop=true; else desktop=false; fi
+		local desktop_default=no
+		if [[ "$agent" != amp ]]; then desktop_default=yes; fi
+		if have_tty && ui_confirm 'Enable secure web workspaces for these runners?' "$desktop_default"; then desktop=true; else desktop=false; fi
 	}
 	if [[ "$desktop" == true && -z "$desktop_access" ]]; then
 		have_tty || die '--desktop-access tailscale or --desktop-access ssh is required with --desktop.'
@@ -1334,7 +1613,9 @@ provision_instances() {
 		case "$desktop_access" in tailscale | ssh) ;; *) die '--desktop-access must be tailscale or ssh.' ;; esac
 	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
-	if [[ "$mode" == docker && "$docker_access" == none ]] && have_tty; then
+	if [[ "$agent" != amp && "$docker_access" != none ]]; then
+		die 'Docker socket access is not supported for Codex or Claude workspaces.'
+	elif [[ "$agent" == amp && "$mode" == docker && "$docker_access" == none ]] && have_tty; then
 		if ui_confirm 'Mount the host Docker socket in every runner? This grants effective host root access.' no; then docker_access=socket; fi
 	fi
 
@@ -1343,25 +1624,30 @@ provision_instances() {
 	if [[ "$auth" == token ]]; then
 		token="${token:-$(cat "$token_file")}"
 	fi
-	authenticate_host "$user" "$auth" "$token"
-	projects_json="$(list_projects_host "$user" "$auth" "$token")"
+	if [[ "$agent" == amp ]]; then
+		authenticate_host "$user" "$auth" "$token"
+		projects_json="$(list_projects_host "$user" "$auth" "$token")"
+	else
+		ensure_github_login "$user"
+		projects_json="$(list_github_repositories "$user")"
+	fi
 
 	if ((${#requested_specs[@]} == 0)); then
-		have_tty || die 'Pass at least one --project PROJECT[=COUNT] without a terminal.'
+		have_tty || die 'Pass at least one --repository OWNER/REPO[=COUNT] without a terminal.'
 		local -a project_options selected_options
 		mapfile -t project_options < <(jq -r '.[] | (.namespace + "/" + .name + "\t" + .repositoryURL)' <<< "$projects_json")
-		((${#project_options[@]} > 0)) || die 'No Amp projects are available to this account.'
-		project_options=('[all projects]' "${project_options[@]}")
-		mapfile -t selected_options < <(ui_choose_many 'Select Amp projects' "${project_options[@]}")
+		((${#project_options[@]} > 0)) || die "No repositories are available for $agent."
+		project_options=('[all repositories]' "${project_options[@]}")
+		mapfile -t selected_options < <(ui_choose_many "Select repositories for $agent" "${project_options[@]}")
 		((${#selected_options[@]} > 0)) || die 'No projects selected.'
 		local selected ref count
-		if printf '%s\n' "${selected_options[@]}" | grep -Fxq '[all projects]'; then
+		if printf '%s\n' "${selected_options[@]}" | grep -Fxq '[all repositories]'; then
 			mapfile -t selected_options < <(jq -r '.[] | .namespace + "/" + .name' <<< "$projects_json")
 		fi
 		for selected in "${selected_options[@]}"; do
-			[[ "$selected" == '[all projects]' ]] && continue
+			[[ "$selected" == '[all repositories]' ]] && continue
 			ref="${selected%%$'\t'*}"
-			count="$(ui_input "Runner count for $ref" 1)"
+			count="$(ui_input "Workspace count for $ref" 1)"
 			[[ "$count" =~ ^[0-9]+$ && "$count" -ge 1 && "$count" -le 100 ]] || die "Runner count must be between 1 and 100: $count"
 			count="$((10#$count))"
 			requested_specs+=("$ref=$count")
@@ -1385,16 +1671,18 @@ provision_instances() {
 		die 'Host mode supports one runner. Use docker, worktree, or devcontainer for a fleet.'
 	fi
 
-	ui_title "Provisioning plan: $total runner(s)"
+	ui_title "Provisioning plan: $total $agent workspace(s)"
 	local index
 	for index in "${!project_refs[@]}"; do
-		printf '  %-32s %s\n' "${project_refs[$index]}" "${project_counts[$index]} x $mode"
+		printf '  %-32s %s\n' "${project_refs[$index]}" "${project_counts[$index]} x $agent/$mode"
 	done
 	if [[ "$desktop" == true ]]; then printf '  %-32s %s\n' 'Web workspace' "$desktop_access access for every runner"; fi
+	if [[ "$native_remote" == true ]]; then printf '  %-32s %s\n' 'Native Remote Control' "enabled for every $agent workspace"; fi
 	if have_tty; then
-		if ! ui_confirm 'Create this runner fleet?' yes; then
+		if ! ui_confirm 'Create this agent fleet?' yes; then
 			if [[ -n "$generated_token_file" ]]; then
 				rm -f -- "$generated_token_file"
+				PROVISION_TEMP_TOKEN_FILE=''
 				trap - EXIT
 			fi
 			return 0
@@ -1408,11 +1696,12 @@ provision_instances() {
 		for ((runner_index = 1; runner_index <= project_count; runner_index++)); do
 			suffix=''
 			if ((project_count > 1)); then suffix="-$runner_index"; fi
-			id="$(next_runner_id "$project_ref-$mode" "$suffix")"
-			local -a add_args=(--mode "$mode" --id "$id" --auth "$auth" --project "$project_ref" --docker-access "$docker_access")
+			id="$(next_runner_id "$project_ref-$agent-$mode" "$suffix")"
+			local -a add_args=(--agent "$agent" --mode "$mode" --id "$id" --auth "$auth" --repository "$project_ref" --docker-access "$docker_access")
 			[[ "$auth" == token ]] && add_args+=(--token-file "$token_file")
 			if [[ "$clone_repo" == true ]]; then add_args+=(--clone); else add_args+=(--no-clone); fi
 			if [[ "$remote_terminal" == true ]]; then add_args+=(--remote-terminal); else add_args+=(--no-remote-terminal); fi
+			if [[ "$native_remote" == true ]]; then add_args+=(--native-remote); else add_args+=(--no-native-remote); fi
 			if [[ "$desktop" == true ]]; then add_args+=(--desktop --desktop-access "$desktop_access"); else add_args+=(--no-desktop); fi
 			add_instance "${add_args[@]}"
 		done
@@ -1420,10 +1709,11 @@ provision_instances() {
 
 	if [[ -n "$generated_token_file" ]]; then
 		rm -f -- "$generated_token_file"
+		PROVISION_TEMP_TOKEN_FILE=''
 		trap - EXIT
 	fi
 	say
-	say "Provisioned $total runner(s)."
+	say "Provisioned $total $agent workspace(s)."
 }
 
 runner_flags() {
@@ -1455,8 +1745,62 @@ run_host_instance() {
 	exec "$amp" "${RUNNER_FLAGS[@]}"
 }
 
+run_agent_container() {
+	local agent="$1" id="$2" workspace volume name network key='' native_remote
+	workspace="$(state_value "$id" '.workspace')"
+	volume="amp-runner-${id}-home"
+	name="amp-runner-$id"
+	network="amp-runner-$id"
+	native_remote="$(native_remote_enabled "$id")"
+	[[ "$(state_value "$id" '.auth')" == token ]] && key="$(token_path "$id")"
+	docker rm --force "$name" >/dev/null 2>&1 || true
+	docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
+	container_agent_common_args "$id" "$workspace" "$volume" "$agent" "$key"
+	CONTAINER_ARGS+=(--name "$name" --network "$network" --init --stop-timeout 30 --cap-drop ALL --pids-limit 4096)
+	if [[ "$agent" == codex ]]; then
+		# Codex's Linux sandbox uses bubblewrap namespaces. These are narrower than --privileged,
+		# but still weaken Docker's default isolation and should only be used for trusted images.
+		CONTAINER_ARGS+=(--cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SETUID --cap-add SETGID --cap-add SYS_PTRACE
+			--security-opt seccomp=unconfined --security-opt apparmor=unconfined)
+	else
+		CONTAINER_ARGS+=(--security-opt no-new-privileges:true)
+	fi
+	if [[ "$native_remote" == true && "$(state_value "$id" '.auth')" == interactive ]]; then
+		CONTAINER_ARGS+=(--env "AGENT_WORKSPACE_ID=$id")
+		case "$agent" in
+		codex)
+			exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c '
+				if ! codex remote-control start; then
+					codex remote-control stop >/dev/null 2>&1 || true
+					echo "Codex experimental Remote Control could not start. Authenticate, then retry: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
+					exec sh -c '\''trap "exit 0" TERM INT; while :; do sleep 3600; done'\''
+				fi
+				trap '\''codex remote-control stop >/dev/null 2>&1 || true; exit 0'\'' TERM INT
+				while :; do
+					pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"
+					[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || exit 1
+					sleep 30
+				done'
+			;;
+		claude)
+			exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c '
+				if ! claude auth status --json | jq -e '\''.loggedIn == true'\'' >/dev/null; then
+					echo "Claude Remote Control is waiting for claude.ai login. Run: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
+					exec sh -c '\''trap "exit 0" TERM INT; while :; do sleep 3600; done'\''
+				fi
+				exec claude remote-control --name "$AGENT_WORKSPACE_ID" --spawn session'
+			;;
+		esac
+	fi
+	exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c 'trap "exit 0" TERM INT; while :; do sleep 3600; done'
+}
+
 run_container_instance() {
-	local id="$1" workspace volume name network key='' access socket_gid
+	local id="$1" workspace volume name network key='' access socket_gid agent
+	agent="$(agent_provider "$id")"
+	if [[ "$agent" != amp ]]; then
+		run_agent_container "$agent" "$id"
+	fi
 	workspace="$(state_value "$id" '.workspace')"
 	volume="amp-runner-${id}-home"
 	name="amp-runner-$id"
@@ -1528,7 +1872,7 @@ stop_instance_runtime() {
 
 list_instances() {
 	require_root list
-	printf '%-28s %-13s %-10s %-10s %-28s %s\n' RUNNER MODE STATUS DESKTOP PROJECT WORKSPACE
+	printf '%-28s %-8s %-13s %-10s %-10s %-28s %s\n' WORKSPACE AGENT MODE STATUS DESKTOP REPOSITORY PATH
 	local file id service status desktop
 	shopt -s nullglob
 	for file in "$STATE_DIR"/*.json; do
@@ -1536,7 +1880,7 @@ list_instances() {
 		service="$(jq -r '.service' "$file")"
 		status="$(systemctl is-active "$service.service" 2>/dev/null || true)"
 		desktop="$(jq -r 'if .desktop.enabled == true then .desktop.access else "off" end' "$file")"
-		printf '%-28s %-13s %-10s %-10s %-28s %s\n' "$id" "$(jq -r '.mode' "$file")" "$status" "$desktop" "$(jq -r '.project' "$file")" "$(jq -r '.workspace' "$file")"
+		printf '%-28s %-8s %-13s %-10s %-10s %-28s %s\n' "$id" "$(jq -r '.agent // "amp"' "$file")" "$(jq -r '.mode' "$file")" "$status" "$desktop" "$(jq -r '.project' "$file")" "$(jq -r '.workspace' "$file")"
 	done
 	shopt -u nullglob
 }
@@ -1564,7 +1908,205 @@ control_instance() {
 	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
 	case "$action" in start | stop | restart) ;; *) die "Invalid runner action: $action" ;; esac
 	systemctl "$action" "$(service_name "$id").service"
-	say "Runner $id: $action requested."
+	say "Agent workspace $id: $action requested."
+}
+
+ensure_instance_running() {
+	local id="$1" service mode attempt
+	service="$(service_name "$id")"
+	if ! systemctl is-active --quiet "$service.service"; then
+		systemctl start "$service.service"
+	fi
+	mode="$(state_value "$id" '.mode')"
+	if [[ "$mode" == docker ]]; then
+		for ((attempt = 1; attempt <= 30; attempt++)); do
+			if [[ "$(docker inspect --format '{{.State.Running}}' "amp-runner-$id" 2>/dev/null || true)" == true ]]; then return; fi
+			sleep 0.5
+		done
+		die "Container amp-runner-$id did not become ready. Check: sudo amp-runner-setup logs $id"
+	fi
+}
+
+connect_instance() {
+	require_root connect
+	local id="$1" agent mode
+	shift
+	if (($#)) && [[ "$1" == -- ]]; then shift; fi
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	mode="$(state_value "$id" '.mode')"
+	[[ "$agent" != amp && "$mode" == docker ]] || die 'connect is for Docker-backed Codex and Claude workspaces.'
+	ensure_instance_running "$id"
+	local -a terminal=(--interactive)
+	if [[ -t 0 && -t 1 ]]; then terminal+=(--tty); fi
+	docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" "$agent" "$@"
+}
+
+shell_instance() {
+	require_root shell
+	local id="$1" mode agent
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	mode="$(state_value "$id" '.mode')"
+	[[ "$mode" == docker ]] || die 'shell currently supports Docker-backed workspaces.'
+	agent="$(agent_provider "$id")"
+	ensure_instance_running "$id"
+	local -a terminal=(--interactive)
+	if [[ -t 0 && -t 1 ]]; then terminal+=(--tty); fi
+	if [[ "$agent" == amp ]]; then
+		docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" bash
+	else
+		docker exec "${terminal[@]}" --env HOME=/agent-home --workdir /workspace "amp-runner-$id" bash
+	fi
+}
+
+authenticate_agent_instance() {
+	require_root authenticate
+	local id="$1" agent
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	[[ "$agent" != amp && "$(state_value "$id" '.mode')" == docker ]] || die 'authenticate is for Docker-backed Codex and Claude workspaces.'
+	have_tty || die 'authenticate requires an interactive terminal.'
+	ensure_instance_running "$id"
+	local -a terminal=(--interactive)
+	if [[ -t 0 && -t 1 ]]; then terminal+=(--tty); fi
+	case "$agent" in
+		codex) docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" codex login --device-auth ;;
+		claude)
+			docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" claude auth login
+			say 'Claude will open once so you can accept workspace trust. Exit Claude after accepting.'
+			docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" claude
+			;;
+	esac
+	if [[ "$(native_remote_enabled "$id")" == true ]]; then
+		systemctl restart "$(service_name "$id").service"
+		say "Restarted $id with native Remote Control."
+	fi
+}
+
+write_auth_method() {
+	local id="$1" method="$2" file tmp
+	file="$(state_file "$id")"
+	tmp="$(mktemp "${file}.XXXXXX")"
+	jq --arg method "$method" '.auth = $method' "$file" > "$tmp"
+	chmod 0644 "$tmp"
+	mv "$tmp" "$file"
+}
+
+write_native_remote() {
+	local id="$1" enabled="$2" file tmp
+	file="$(state_file "$id")"
+	tmp="$(mktemp "${file}.XXXXXX")"
+	jq --argjson enabled "$enabled" '.nativeRemote = $enabled' "$file" > "$tmp"
+	chmod 0644 "$tmp"
+	mv "$tmp" "$file"
+}
+
+native_remote_status() {
+	require_root remote
+	local id="$1" agent enabled service_state runtime_state=inactive
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	[[ "$agent" != amp && "$(state_value "$id" '.mode')" == docker ]] || die 'remote is for Docker-backed Codex and Claude workspaces.'
+	enabled="$(native_remote_enabled "$id")"
+	service_state="$(systemctl is-active "$(service_name "$id").service" 2>/dev/null || true)"
+	if [[ "$(docker inspect --format '{{.State.Running}}' "amp-runner-$id" 2>/dev/null || true)" == true ]]; then
+		case "$agent" in
+		codex)
+			if docker exec "amp-runner-$id" sh -c 'pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null'; then runtime_state=running; fi
+			;;
+		claude)
+			if docker exec "amp-runner-$id" pgrep -f '^/agent-home/.local/bin/claude remote-control' >/dev/null; then runtime_state=running; fi
+			;;
+		esac
+	fi
+	printf 'Workspace: %s\nProvider: %s\nConfigured: %s\nService: %s\nRemote runtime: %s\n' "$id" "$agent" "$enabled" "$service_state" "$runtime_state"
+	if [[ "$agent" == codex && "$runtime_state" == running ]]; then
+		printf 'Pair a device: sudo amp-runner-setup remote pair %s\n' "$id"
+	elif [[ "$agent" == claude && "$runtime_state" == running ]]; then
+		printf 'Open https://claude.ai/code or the Claude mobile app with the authenticated account.\n'
+	fi
+}
+
+native_remote_command() {
+	local action="${1:-}" id="${2:-}" agent
+	[[ -n "$action" && -n "$id" && $# == 2 ]] || die 'remote requires enable, disable, status, or pair and RUNNER_ID.'
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	[[ "$agent" != amp && "$(state_value "$id" '.mode')" == docker ]] || die 'remote is for Docker-backed Codex and Claude workspaces.'
+	case "$action" in
+	enable)
+		require_root remote
+		[[ "$(state_value "$id" '.auth')" == interactive ]] || die 'Native Remote Control requires provider account login. Clear the API key first.'
+		write_native_remote "$id" true
+		systemctl restart "$(service_name "$id").service"
+		say "$agent native Remote Control enabled for $id."
+		;;
+	disable)
+		require_root remote
+		write_native_remote "$id" false
+		systemctl restart "$(service_name "$id").service"
+		say "$agent native Remote Control disabled for $id."
+		;;
+	status) native_remote_status "$id" ;;
+	pair)
+		require_root remote
+		[[ "$agent" == codex ]] || die 'Claude sessions appear directly at https://claude.ai/code and do not use a pairing command.'
+		[[ "$(native_remote_enabled "$id")" == true ]] || die "Enable native Remote Control first: sudo amp-runner-setup remote enable $id"
+		ensure_instance_running "$id"
+		docker exec --interactive "amp-runner-$id" codex remote-control pair
+		;;
+	*) die 'remote expects enable, disable, status, or pair.' ;;
+	esac
+}
+
+set_agent_api_key() {
+	require_root credentials
+	local id="$1" token_file="${2:-}" agent token
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	[[ "$agent" != amp ]] || die 'credentials set currently supports Codex and Claude workspaces.'
+	if [[ -n "$token_file" ]]; then
+		[[ -r "$token_file" ]] || die "Cannot read token file: $token_file"
+		token="$(cat "$token_file")"
+	else
+		have_tty || die 'Pass --token-file PATH without a terminal.'
+		token="$(ui_password "$agent API key")"
+	fi
+	store_token "$id" "$token" 1000 "$agent"
+	write_auth_method "$id" token
+	write_native_remote "$id" false
+	systemctl restart "$(service_name "$id").service"
+	if desktop_enabled "$id"; then systemctl restart "$(desktop_service_name "$id").service"; fi
+	say "$agent API key updated for $id."
+	say 'Native Remote Control was disabled because provider API keys do not support it.'
+}
+
+clear_agent_api_key() {
+	require_root credentials
+	local id="$1" agent
+	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
+	agent="$(agent_provider "$id")"
+	[[ "$agent" != amp ]] || die 'credentials clear currently supports Codex and Claude workspaces.'
+	rm -f "$(token_path "$id")"
+	write_auth_method "$id" interactive
+	systemctl restart "$(service_name "$id").service"
+	if desktop_enabled "$id"; then systemctl restart "$(desktop_service_name "$id").service"; fi
+	say "$agent API key removed from $id. Stored login state was retained."
+}
+
+credentials_command() {
+	local action="${1:-}" id="${2:-}"
+	[[ -n "$action" && -n "$id" ]] || die 'credentials requires set or clear and RUNNER_ID.'
+	shift 2
+	case "$action" in
+	set)
+		local token_file=''
+		if (($#)); then [[ "$1" == --token-file && $# == 2 ]] || die 'credentials set accepts --token-file PATH.'; token_file="$2"; fi
+		set_agent_api_key "$id" "$token_file"
+		;;
+	clear) (($# == 0)) || die 'credentials clear accepts no options.'; clear_agent_api_key "$id" ;;
+	*) die 'credentials expects set or clear.' ;;
+	esac
 }
 
 set_remote_terminal() {
@@ -1581,10 +2123,32 @@ set_remote_terminal() {
 	say "Runner $id remote terminal access: $enabled"
 }
 
+update_agent_cli_volume() {
+	local agent="$1" id="$2" workspace="$3" old_version new_version
+	local volume="amp-runner-${id}-home"
+	container_agent_common_args "$id" "$workspace" "$volume" "$agent" ''
+	CONTAINER_ARGS+=(--env HOME=/agent-home)
+	old_version="$(docker run "${CONTAINER_ARGS[@]}" "$IMAGE" "$agent" --version 2>/dev/null || true)"
+	case "$agent" in
+	codex)
+		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c \
+			'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_HOME=/agent-home/.codex CODEX_INSTALL_DIR=/agent-home/.local/bin CODEX_NON_INTERACTIVE=true sh'
+		;;
+	claude)
+		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c \
+			'curl -fsSL https://claude.ai/install.sh | HOME=/agent-home bash'
+		;;
+	esac
+	new_version="$(docker run "${CONTAINER_ARGS[@]}" "$IMAGE" "$agent" --version)"
+	AGENT_CLI_CHANGED=false
+	[[ "$old_version" == "$new_version" ]] || AGENT_CLI_CHANGED=true
+}
+
 update_instances() {
 	require_root update
-	local target="${1:---all}" file id mode user image_built=false
+	local target="${1:---all}" file id mode user agent image_built=false image_changed=false old_image='' new_image should_restart
 	local rebuild_image="${AMP_RUNNER_REBUILD_IMAGE:-true}"
+	local force_restart="${AMP_RUNNER_FORCE_RESTART:-true}"
 	install_tool_files
 	for file in "$STATE_DIR"/*.json; do
 		[[ -e "$file" ]] || continue
@@ -1592,17 +2156,31 @@ update_instances() {
 		[[ "$target" == --all || "$target" == "$id" ]] || continue
 		mode="$(jq -r '.mode' "$file")"
 		user="$(jq -r '.user' "$file")"
-		write_unit "$id" "$mode" "$user" "$(jq -r '.auth' "$file")"
+		agent="$(jq -r '.agent // "amp"' "$file")"
+		should_restart=true
+		write_unit "$id" "$mode" "$user" "$(jq -r '.auth' "$file")" "$agent"
 		if [[ "$(jq -r '.desktop.enabled // false' "$file")" == true ]]; then write_desktop_unit "$id"; fi
 		case "$mode" in
 		host | worktree)
 			host_amp "$user" update
 			;;
 		docker)
-			if [[ "$rebuild_image" == true && "$image_built" == false ]]; then build_image; image_built=true; fi
-			local key=''
-			[[ "$(jq -r '.auth' "$file")" == token ]] && key="$(token_path "$id")"
-			container_amp "$id" "$(jq -r '.workspace' "$file")" "amp-runner-${id}-home" "$key" update
+			if [[ "$rebuild_image" == true && "$image_built" == false ]]; then
+				old_image="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+				build_image
+				new_image="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+				[[ "$old_image" == "$new_image" ]] || image_changed=true
+				image_built=true
+			fi
+			if [[ "$agent" == amp ]]; then
+				local key=''
+				[[ "$(jq -r '.auth' "$file")" == token ]] && key="$(token_path "$id")"
+				container_amp "$id" "$(jq -r '.workspace' "$file")" "amp-runner-${id}-home" "$key" update
+			else
+				update_agent_cli_volume "$agent" "$id" "$(jq -r '.workspace' "$file")"
+				should_restart=false
+				if [[ "$image_changed" == true || "$AGENT_CLI_CHANGED" == true || "$force_restart" == true ]]; then should_restart=true; fi
+			fi
 			;;
 		devcontainer)
 			local cid token=''
@@ -1611,7 +2189,7 @@ update_instances() {
 			devcontainer_amp "$id" "$cid" "$token" update
 			;;
 		esac
-		systemctl restart "$(service_name "$id").service"
+		if [[ "$should_restart" == true ]]; then systemctl restart "$(service_name "$id").service"; fi
 	done
 }
 
@@ -1671,15 +2249,16 @@ automatic_update() {
 	if [[ "$SELF_UPDATED" == true ]]; then
 		exec "$INSTALL_DIR/setup.sh" _activate-update
 	fi
-	AMP_RUNNER_REBUILD_IMAGE=false update_instances --all
+	AMP_RUNNER_REBUILD_IMAGE=true AMP_RUNNER_FORCE_RESTART=false update_instances --all
+	AMP_RUNNER_FORCE_RESTART=false update_desktops --all
 }
 
 activate_update() {
 	require_root activate-update
 	install_auto_update_timer
 	"$INSTALL_DIR/scripts/install-runtimes.sh" browser
-	env AMP_RUNNER_REBUILD_IMAGE=true "$INSTALL_DIR/setup.sh" update --all
-	"$INSTALL_DIR/setup.sh" desktop-update --all
+	env AMP_RUNNER_REBUILD_IMAGE=true AMP_RUNNER_FORCE_RESTART=true "$INSTALL_DIR/setup.sh" update --all
+	env AMP_RUNNER_FORCE_RESTART=true "$INSTALL_DIR/setup.sh" desktop-update --all
 }
 
 auto_update_control() {
@@ -1753,7 +2332,7 @@ remove_instance() {
 	[[ -r "$file" ]] || die "Unknown runner: $id"
 	if [[ "$purge" != --purge ]]; then
 		if have_tty; then
-			ui_confirm "Remove runner $id? Its workspace and container home will be retained." no || return
+			ui_confirm "Remove agent workspace $id? Its repository and container home will be retained." no || return
 		else
 			die 'Pass --purge to remove non-interactively, or use a terminal for a retaining removal.'
 		fi
@@ -1782,7 +2361,7 @@ remove_instance() {
 	fi
 	rm -f "$file"
 	systemctl daemon-reload
-	say "Removed runner $id."
+	say "Removed agent workspace $id."
 }
 
 uninstall_tool() {
@@ -1810,7 +2389,7 @@ uninstall_tool() {
 
 show_help() {
 	cat <<EOF
-Amp runner setup $VERSION
+Agent workspace manager $VERSION
 
 Usage:
   sudo ./setup.sh bootstrap [--harden-ssh] [--tailscale] [--non-interactive]
@@ -1820,6 +2399,12 @@ Usage:
   sudo ./setup.sh status RUNNER_ID
   sudo ./setup.sh logs RUNNER_ID [--follow]
   sudo ./setup.sh start|stop|restart RUNNER_ID
+  sudo ./setup.sh connect RUNNER_ID [-- AGENT_ARGS...]
+  sudo ./setup.sh shell RUNNER_ID
+  sudo ./setup.sh authenticate RUNNER_ID
+  sudo ./setup.sh remote enable|disable|status|pair RUNNER_ID
+  sudo ./setup.sh credentials set RUNNER_ID [--token-file PATH]
+  sudo ./setup.sh credentials clear RUNNER_ID
   sudo ./setup.sh configure RUNNER_ID --remote-terminal|--no-remote-terminal
   sudo ./setup.sh desktop enable RUNNER_ID [--access tailscale|ssh]
   sudo ./setup.sh desktop disable|status|credentials RUNNER_ID
@@ -1836,20 +2421,29 @@ Usage:
   sudo ./setup.sh uninstall [--purge]
 
 Add options:
+  --agent amp|codex|claude
   --mode host|docker|worktree|devcontainer
   --id DNS_LABEL
   --auth interactive|token
   --token-file PATH
-  --project NAMESPACE/NAME
+  --repository OWNER/REPOSITORY
   --workspace ABSOLUTE_PATH
   --clone | --no-clone
   --remote-terminal | --no-remote-terminal
+  --native-remote | --no-native-remote
   --desktop | --no-desktop
   --desktop-access tailscale|ssh
   --docker-access none|socket
 
 Provision accepts the same common options and repeatable:
-  --project NAMESPACE/NAME[=COUNT]
+  --repository OWNER/REPOSITORY[=COUNT]
+
+Codex and Claude use independent, persistent Docker workspaces and can run their
+provider Remote Control services with account login. Claude supports documented
+headless Remote Control. Codex exposes an experimental, opt-in CLI daemon that
+is not a supported replacement for OpenAI's desktop Remote workflow. Amp also
+supports host, worktree, and devcontainer modes. API keys are stored in root-only
+files and mounted as read-only runtime secrets, never saved in state or argv.
 
 Run without a command for the terminal menu.
 EOF
@@ -1860,6 +2454,8 @@ capability_report() {
 Self-hosted runner capabilities
 
 Available
+  Claude Remote Control         documented headless provider relay
+  Codex Remote Control          opt-in experimental CLI daemon
   Remote thread creation          amp --no-tui
   Web and mobile remote control   Amp thread page
   Shared web terminal             opt-in per runner
@@ -1901,12 +2497,12 @@ runner_summary() {
 	fi
 	local updates=disabled
 	if systemctl is-enabled --quiet "$AUTO_UPDATE_TIMER" 2>/dev/null; then updates=enabled; fi
-	printf '%s/%s runners    %s/%s web workspaces    auto-updates %s' "$active" "$total" "$desktop_active" "$desktops" "$updates"
+	printf '%s/%s agents    %s/%s web workspaces    auto-updates %s' "$active" "$total" "$desktop_active" "$desktops" "$updates"
 }
 
 dashboard_header() {
 	if command -v clear >/dev/null 2>&1 && [[ -n "${TERM:-}" ]]; then clear; fi
-	ui_title "Amp Runner Control  v$VERSION"
+	ui_title "Agent Workspace Control  v$VERSION"
 	printf '%s\n\n' "$(runner_summary)"
 }
 
@@ -1917,11 +2513,11 @@ choose_runner_id() {
 		[[ -e "$file" ]] || continue
 		id="$(jq -r '.id' "$file")"
 		status="$(systemctl is-active "$(service_name "$id").service" 2>/dev/null || true)"
-		options+=("$id"$'\t'"$status"$'\t'"$(jq -r '.project + "  [" + .mode + "]"' "$file")")
+		options+=("$id"$'\t'"$status"$'\t'"$(jq -r '.project + "  [" + (.agent // "amp") + "/" + .mode + "]"' "$file")")
 	done
-	((${#options[@]} > 0)) || die 'No runners are configured.'
+	((${#options[@]} > 0)) || die 'No agent workspaces are configured.'
 	local selected
-	selected="$(ui_choose 'Find a runner' "${options[@]}")"
+	selected="$(ui_choose 'Find an agent workspace' "${options[@]}")"
 	printf '%s\n' "${selected%%$'\t'*}"
 }
 
@@ -1962,13 +2558,21 @@ web_workspace_menu() {
 }
 
 manage_runner_menu() {
-	local id action enabled
+	local id action enabled agent
 	id="$(choose_runner_id)"
+	agent="$(agent_provider "$id")"
 	while true; do
 		dashboard_header
-		ui_title "Runner: $id"
-		printf '%s\n' "$(jq -r '.project + "    " + .mode + "    " + .workspace' "$(state_file "$id")")"
-		action="$(ui_choose 'Runner action' 'Status' 'Logs' 'Follow logs' 'Start' 'Stop' 'Restart' 'Web workspace' 'Toggle Amp shared terminal' 'Remove' 'Back')"
+		ui_title "$agent workspace: $id"
+		printf '%s\n' "$(jq -r '.project + "    " + (.agent // "amp") + "/" + .mode + "    " + .workspace' "$(state_file "$id")")"
+		local -a actions=('Status' 'Logs' 'Follow logs' 'Start' 'Stop' 'Restart')
+		if [[ "$agent" == amp ]]; then
+			actions+=('Web workspace' 'Toggle Amp shared terminal')
+		else
+			actions+=('Open agent CLI' 'Open shell' 'Native Remote Control' 'Authenticate' 'Set API key' 'Clear API key' 'Web workspace')
+		fi
+		actions+=('Remove' 'Back')
+		action="$(ui_choose 'Workspace action' "${actions[@]}")"
 		case "$action" in
 		Status) show_status "$id"; ui_pause ;;
 		Logs) show_logs "$id"; ui_pause ;;
@@ -1976,6 +2580,15 @@ manage_runner_menu() {
 		Start) control_instance start "$id"; ui_pause ;;
 		Stop) control_instance stop "$id"; ui_pause ;;
 		Restart) control_instance restart "$id"; ui_pause ;;
+		'Open agent CLI') connect_instance "$id"; ui_pause ;;
+		'Open shell') shell_instance "$id"; ui_pause ;;
+		'Native Remote Control') native_remote_menu "$id" ;;
+		Authenticate) authenticate_agent_instance "$id"; ui_pause ;;
+		'Set API key') set_agent_api_key "$id"; ui_pause ;;
+		'Clear API key')
+			if ui_confirm "Remove the API key for $id?" no; then clear_agent_api_key "$id"; fi
+			ui_pause
+			;;
 		'Web workspace') web_workspace_menu "$id" ;;
 		'Toggle Amp shared terminal')
 			enabled="$(state_value "$id" '.remoteTerminal')"
@@ -1988,17 +2601,44 @@ manage_runner_menu() {
 	done
 }
 
+native_remote_menu() {
+	local id="$1" action enabled agent
+	agent="$(agent_provider "$id")"
+	while true; do
+		dashboard_header
+		ui_title "$agent Remote Control: $id"
+		enabled="$(native_remote_enabled "$id")"
+		if [[ "$enabled" == true ]]; then
+			if [[ "$agent" == codex ]]; then
+				action="$(ui_choose 'Remote action' 'Status' 'Pair device' 'Restart' 'Disable' 'Back')"
+			else
+				action="$(ui_choose 'Remote action' 'Status' 'Restart' 'Disable' 'Back')"
+			fi
+		else
+			action="$(ui_choose 'Remote action' 'Status' 'Enable' 'Back')"
+		fi
+		case "$action" in
+		Status) native_remote_status "$id"; ui_pause ;;
+		'Pair device') native_remote_command pair "$id"; ui_pause ;;
+		Restart) control_instance restart "$id"; ui_pause ;;
+		Enable) native_remote_command enable "$id"; ui_pause ;;
+		Disable) native_remote_command disable "$id"; ui_pause ;;
+		Back) return ;;
+		esac
+	done
+}
+
 updates_menu() {
 	local action
 	while true; do
 		dashboard_header
 		ui_title 'Updates'
-		action="$(ui_choose 'Update action' 'Update Amp CLIs' 'Rebuild image and update Amp' 'Update web workspace image' 'Update runner setup from GitHub release' 'Automatic update status' 'Enable automatic updates' 'Disable automatic updates' 'Back')"
+		action="$(ui_choose 'Update action' 'Update Amp CLIs' 'Rebuild agent image and update CLIs' 'Update web workspace image' 'Update manager from GitHub release' 'Automatic update status' 'Enable automatic updates' 'Disable automatic updates' 'Back')"
 		case "$action" in
 		'Update Amp CLIs') AMP_RUNNER_REBUILD_IMAGE=false update_instances --all; ui_pause ;;
-		'Rebuild image and update Amp') update_instances --all; ui_pause ;;
+		'Rebuild agent image and update CLIs') update_instances --all; ui_pause ;;
 		'Update web workspace image') update_desktops --all; ui_pause ;;
-		'Update runner setup from GitHub release') self_update; ui_pause ;;
+		'Update manager from GitHub release') self_update; ui_pause ;;
 		'Automatic update status') auto_update_control status; ui_pause ;;
 		'Enable automatic updates') auto_update_control enable; ui_pause ;;
 		'Disable automatic updates') auto_update_control disable; ui_pause ;;
@@ -2028,12 +2668,12 @@ menu() {
 	local action
 	while true; do
 		dashboard_header
-		action="$(ui_choose 'Choose an area' 'Provision runner fleet' 'Add one runner' 'Manage runners' 'List runners' 'Updates' 'Host and features' 'Quit')"
+		action="$(ui_choose 'Choose an area' 'Provision agent fleet' 'Add one workspace' 'Manage workspaces' 'List workspaces' 'Updates' 'Host and features' 'Quit')"
 		case "$action" in
-		'Provision runner fleet') provision_instances; ui_pause ;;
-		'Add one runner') add_instance; ui_pause ;;
-		'Manage runners') manage_runner_menu ;;
-		'List runners') list_instances; ui_pause ;;
+		'Provision agent fleet') provision_instances; ui_pause ;;
+		'Add one workspace') add_instance; ui_pause ;;
+		'Manage workspaces') manage_runner_menu ;;
+		'List workspaces') list_instances; ui_pause ;;
 		Updates) updates_menu ;;
 		'Host and features') host_menu ;;
 		Quit) return ;;
@@ -2053,6 +2693,11 @@ main() {
 	status) (($# >= 1)) || die 'status requires RUNNER_ID'; show_status "$@" ;;
 	logs) (($# >= 1)) || die 'logs requires RUNNER_ID'; show_logs "$@" ;;
 	start | stop | restart) (($# == 1)) || die "$command requires RUNNER_ID"; control_instance "$command" "$1" ;;
+	connect) (($# >= 1)) || die 'connect requires RUNNER_ID'; connect_instance "$@" ;;
+	shell) (($# == 1)) || die 'shell requires RUNNER_ID'; shell_instance "$1" ;;
+	authenticate) (($# == 1)) || die 'authenticate requires RUNNER_ID'; authenticate_agent_instance "$1" ;;
+	remote) native_remote_command "$@" ;;
+	credentials) credentials_command "$@" ;;
 	configure)
 		(($# == 2)) || die 'configure requires RUNNER_ID and --remote-terminal or --no-remote-terminal'
 		case "$2" in --remote-terminal) set_remote_terminal "$1" true ;; --no-remote-terminal) set_remote_terminal "$1" false ;; *) die "Unknown configure option: $2" ;; esac

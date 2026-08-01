@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+agent="$(basename "$0")"
+case "$agent" in
+	codex | claude) ;;
+	*) printf 'Unsupported agent CLI: %s\n' "$agent" >&2; exit 2 ;;
+esac
+
+if [[ -d /agent-home ]]; then
+	export HOME=/agent-home
+fi
+
+if [[ "$agent" == codex ]]; then
+	export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+	mkdir -p "$CODEX_HOME"
+	if [[ -r /run/secrets/agent_api_key ]]; then
+		export OPENAI_API_KEY
+		OPENAI_API_KEY="$(cat /run/secrets/agent_api_key)"
+	fi
+	real_cli="$HOME/.local/bin/codex"
+else
+	export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+	mkdir -p "$CLAUDE_CONFIG_DIR"
+	if [[ -r /run/secrets/agent_api_key ]]; then
+		export ANTHROPIC_API_KEY
+		ANTHROPIC_API_KEY="$(cat /run/secrets/agent_api_key)"
+	fi
+	real_cli="$HOME/.local/bin/claude"
+fi
+
+[[ -x "$real_cli" ]] || {
+	printf '%s native CLI is missing from %s. Rebuild the agent image and recreate this workspace.\n' "$agent" "$HOME" >&2
+	exit 1
+}
+
+exec "$real_cli" "$@"

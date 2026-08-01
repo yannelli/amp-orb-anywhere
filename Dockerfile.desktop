@@ -1,15 +1,36 @@
 FROM lscr.io/linuxserver/webtop:debian-xfce
 
+ARG NODE_MAJOR=24
+ARG CODEX_VERSION=latest
+ARG CLAUDE_CODE_VERSION=latest
+
 USER root
 
+COPY scripts/install-runtimes.sh /tmp/install-runtimes.sh
 RUN apt-get update \
-	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends firefox-esr \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bubblewrap ca-certificates curl firefox-esr jq xz-utils \
+	&& NODE_MAJOR="$NODE_MAJOR" /tmp/install-runtimes.sh node \
+	&& chmod u+s /usr/bin/bwrap \
 	&& for directory in /usr/share/applications /usr/local/share/applications; do \
 		[ ! -d "$directory" ] || find "$directory" -maxdepth 1 -type f -name '*.desktop' \
 			! -name 'chromium.desktop' \
 			! -name 'firefox-esr.desktop' \
 			! -name 'xfce4-terminal.desktop' \
-			! -name 'Thunar.desktop' \
+			! -name 'thunar.desktop' \
 			-exec sh -c 'printf "\nNoDisplay=true\n" >> "$1"' _ {} \;; \
 	done \
-	&& rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+	&& install -d -o 1000 -g 1000 /agent-home \
+	&& chown -R 1000:1000 /agent-home
+
+USER 1000
+RUN HOME=/agent-home CODEX_HOME=/agent-home/.codex CODEX_INSTALL_DIR=/agent-home/.local/bin CODEX_NON_INTERACTIVE=true \
+		sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh -s -- --release "$1"' _ "$CODEX_VERSION" \
+	&& HOME=/agent-home sh -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$1"' _ "$CLAUDE_CODE_VERSION"
+
+USER root
+RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+COPY scripts/agent-cli-launcher /usr/local/libexec/agent-cli-launcher
+RUN chmod 0755 /usr/local/libexec/agent-cli-launcher \
+	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/codex \
+	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/claude

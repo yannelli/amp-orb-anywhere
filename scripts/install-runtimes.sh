@@ -6,7 +6,7 @@ GO_VERSION="${GO_VERSION:-latest}"
 RUST_TOOLCHAIN="${RUST_TOOLCHAIN:-stable}"
 TARGET="${1:-all}"
 
-case "$TARGET" in all | browser) ;; *) printf 'Usage: %s [all|browser]\n' "$0" >&2; exit 2 ;; esac
+case "$TARGET" in all | browser | node) ;; *) printf 'Usage: %s [all|browser|node]\n' "$0" >&2; exit 2 ;; esac
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 	printf 'install-runtimes.sh must run as root\n' >&2
@@ -130,6 +130,10 @@ if [[ "$TARGET" == browser ]]; then
 fi
 
 install_node
+if [[ "$TARGET" == node ]]; then
+	printf 'Node %s installed\n' "$(node --version)"
+	exit 0
+fi
 install_go
 install_rust
 install_agent_browser

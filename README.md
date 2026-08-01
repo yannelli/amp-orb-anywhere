@@ -34,17 +34,17 @@
 
 ## Introduction
 
-A self-hosted Amp runner is a persistent `amp --no-tui` process on a machine you control. Amp Orb Anywhere provisions an Ubuntu 24.04 Lightsail VM (or a similar Ubuntu 24.04 host), installs a development toolchain, and manages one or more runners under systemd.
+A self-hosted Amp runner is a persistent `amp --no-tui` process on a machine you control. Amp Orb Anywhere also manages OpenAI Codex and Anthropic Claude Code as independent Docker workspaces. Codex and Claude are not registered with or managed by Amp. Claude's documented headless Remote Control can stay online in its container. Codex can run its shipped experimental Remote Control daemon, but OpenAI does not document that daemon as a supported substitute for its desktop Remote workflow. The project provisions an Ubuntu 24.04 Lightsail VM (or a similar Ubuntu 24.04 host), installs a development toolchain, and manages all three agents under systemd.
 
 This repository does not turn a VM or Docker container into an Amp-managed orb. Managed orbs depend on Amp infrastructure for fresh per-thread VMs, pause and resume, portals, OIDC, secrets, webhooks, apps, multiplayer, and `amp sync`. Local counterparts include an authenticated browser workspace with terminal, Chromium, Firefox, and file management. The setup command prints the current boundary with `amp-runner-setup capabilities`.
 
-Checked against the Amp manual and Amp CLI `0.0.1785589004-g6b3dd2` on 2026-08-01. Amp changes quickly. Confirm current flags and auth flow in the [Owner's Manual](https://ampcode.com/manual) before you rely on a command documented here.
+Checked against the Amp manual, the current [Codex CLI documentation](https://developers.openai.com/codex/cli), OpenAI's secure Codex dev-container configuration, Anthropic's [Claude Code setup guide](https://code.claude.com/docs/en/setup), and the [Claude Remote Control guide](https://code.claude.com/docs/en/remote-control) on 2026-08-01. The images use both vendors' native installers and resolve their latest releases whenever they are rebuilt.
 
 ## Requirements
 
 - Fresh Ubuntu 24.04 instance (Lightsail is the primary target)
 - Root via `sudo`
-- Outbound HTTPS, DNS, and WebSocket access (Amp, Git hosts, package registries)
+- Outbound HTTPS, DNS, and WebSocket access (Amp, OpenAI, Anthropic, Git hosts, and package registries)
 - A non-root admin account for host-mode runners (`ubuntu` on Lightsail, or set `AMP_RUNNER_ADMIN_USER`)
 
 No inbound ports are required by Amp. The runner opens outbound connections.
@@ -107,7 +107,7 @@ Do not put an Amp token, GitHub token, Tailscale reusable key, or SSH private ke
 
 ### Interactive Setup
 
-After bootstrap, open the control dashboard or add a runner directly:
+After bootstrap, open the control dashboard or add an agent workspace directly:
 
 ```bash
 sudo amp-runner-setup
@@ -115,27 +115,28 @@ sudo amp-runner-setup
 sudo amp-runner-setup add
 ```
 
-The dashboard has fleet provisioning, runner status and controls, logs, Amp shared-terminal settings, secure web workspaces, updates, diagnostics, and a feature compatibility screen. Its searchable menus use `gum` and fall back to numbered shell menus.
+The dashboard starts with an agent picker. It has fleet provisioning, repository search, per-repository counts, lifecycle controls, interactive agent and shell access, authentication, API-key rotation, secure web workspaces, updates, diagnostics, and a feature compatibility screen. Its searchable menus use `gum` and fall back to numbered shell menus.
 
 ### Fleet Provisioning
 
-Select any subset of the projects returned by `amp projects list`, then set a runner count for each project:
+Select Amp, Codex, or Claude, choose any subset of the available repositories, then set a workspace count for each:
 
 ```bash
 sudo amp-runner-setup provision
 ```
 
-The wizard authenticates once for project discovery, supports an `all projects` selection, previews the plan, and creates stable runner IDs. Token authentication is the smoother option for a Docker fleet because every isolated runner home needs Amp credentials.
+Amp discovery uses `amp projects list`. Codex and Claude discovery uses the authenticated host `gh` account and includes repositories where it is an owner, collaborator, or organization member. The wizard supports an `all repositories` selection, previews the plan, and creates stable workspace IDs. Each Docker workspace has independent agent and GitHub authentication state.
 
-The same operation is scriptable. Repeat `--project` and append `=COUNT` when a project needs more than one runner:
+The same operation is scriptable. Repeat `--repository` and append `=COUNT` when a repository needs more than one workspace:
 
 ```bash
 sudo amp-runner-setup provision \
+  --agent amp \
   --mode docker \
   --auth token \
   --token-file /root/amp-token \
-  --project owner/api=2 \
-  --project owner/web=3 \
+  --repository owner/api=2 \
+  --repository owner/web=3 \
   --clone \
   --remote-terminal \
   --desktop \
@@ -143,19 +144,20 @@ sudo amp-runner-setup provision \
   --docker-access none
 ```
 
-Create missing Amp projects first with `amp projects create REPOSITORY`. The wizard lists Amp projects, not every repository visible to GitHub CLI.
+Create missing Amp projects first with `amp projects create REPOSITORY`. Codex and Claude do not require an Amp project.
 
 ### Non-interactive Setup
 
 ```bash
 sudo amp-runner-setup add \
+  --agent codex \
   --mode docker \
-  --id build-1 \
-  --auth token \
-  --token-file /root/amp-token \
-  --project owner/project \
+  --id codex-build-1 \
+  --auth interactive \
+  --repository owner/project \
   --clone \
   --no-remote-terminal \
+  --native-remote \
   --desktop \
   --desktop-access ssh \
   --docker-access none
@@ -163,20 +165,24 @@ sudo amp-runner-setup add \
 
 | Option | Values | Notes |
 | --- | --- | --- |
+| `--agent` | `amp`, `codex`, `claude` | Defaults to an interactive picker |
 | `--mode` | `host`, `docker`, `worktree`, `devcontainer` | See [Instance Types](#instance-types) |
 | `--id` | DNS label | Stable lowercase id used in unit names and volumes |
 | `--auth` | `interactive`, `token` | Token mode needs `--token-file` |
-| `--project` | `namespace/name` or project id | Selects from `amp projects list` |
+| `--repository` | `owner/name` | Amp selects a matching project; Codex and Claude select from GitHub CLI |
 | `--workspace` | absolute path | Defaults under `/srv/amp-runners/workspaces` |
 | `--clone` / `--no-clone` | flag | Whether to clone the project repository |
-| `--remote-terminal` / `--no-remote-terminal` | flag | Opt-in terminal for remotely controlled threads |
+| `--remote-terminal` / `--no-remote-terminal` | flag | Amp only: opt-in terminal for remotely controlled threads |
+| `--native-remote` / `--no-native-remote` | flag | Codex/Claude only: persistent provider-native Remote Control; requires account login |
 | `--desktop` / `--no-desktop` | flag | Per-runner browser workspace with terminal, browsers, and files |
 | `--desktop-access` | `tailscale`, `ssh` | Tailnet HTTPS route or loopback service reached through SSH |
-| `--docker-access` | `none`, `socket` | Host Docker socket mount for container modes |
+| `--docker-access` | `none`, `socket` | Amp only: host Docker socket mount for container mode |
 
-Delete the source token file after setup. The installed copy lives under `/etc/amp-runner/secrets` with mode `0400` and is loaded by systemd as a credential.
+Delete the source token file after setup. The installed copy lives under `/etc/amp-runner/secrets` with mode `0400`. API keys are mounted read-only at runtime rather than placed in state, image layers, environment literals, or command-line arguments.
 
 ### Instance Types
+
+Amp supports all four modes below. Codex and Claude currently use Docker mode only. With native Remote Control enabled, the systemd service runs the provider's remote server in the persistent workspace container. Without it, the container stays idle until the TUI, `connect`, or the web desktop starts a CLI.
 
 | Type | Intended use | Separation | Docker inside runner | Main risk |
 | --- | --- | --- | --- | --- |
@@ -189,6 +195,8 @@ Pick `host` for one trusted project on a dedicated VM. Pick `docker` without `--
 
 The generic Docker image includes a broad development toolchain. The service container drops all capabilities and sets `no-new-privileges`, so the `amp` user cannot elevate with sudo at runtime. Rebuild the image to add OS packages. In-container Docker builds need `--docker-access socket` or a separate remote builder.
 
+Codex is the exception to the default Docker capability profile. OpenAI's current Linux sandbox uses setuid bubblewrap inside the container. The headless Codex service drops all capabilities, then adds only `SYS_ADMIN`, `SYS_CHROOT`, `SETUID`, `SETGID`, and `SYS_PTRACE`, and disables the outer Docker seccomp and AppArmor profiles. Webtop retains Docker's default capability set for its root init, then adds the same sandbox capabilities. Codex applies its own inner seccomp policy after bubblewrap creates the namespace. This is narrower than `--privileged`, excludes OpenAI's optional firewall-only `NET_ADMIN` and `NET_RAW` capabilities, and still weakens the outer container boundary. Use a separate VM for untrusted repositories or trust domains. Claude needs none of these added capabilities.
+
 Dev-container mode uses the project's `.devcontainer/devcontainer.json` or `.devcontainer.json`. It mounts a named volume at `/amp-runner-home`, installs Amp there, and reuses that home across rebuilds. The setup tool does not rewrite project configuration or change the project's security settings.
 
 ## Authentication and Projects
@@ -199,9 +207,42 @@ The selection screen is populated by `amp projects list --json`. A selected proj
 
 Amp authentication and Git-host authentication are separate. `amp clone namespace/name` covers Amp-hosted repositories. The setup offers `gh auth login` for GitHub. Other private Git hosts need SSH keys, a credential helper, or another Git credential mechanism on the runner identity.
 
+For a GitHub-backed Docker workspace, setup copies the authenticated host `gh` credential into that workspace over stdin, then configures Git's `gh` credential helper. The token is never placed in state, Docker environment literals, argv, or a clone URL. Each selected workspace receives the host GitHub identity's repository access, so use a dedicated, least-privilege GitHub account or token when workspaces should not share your full account scope.
+
 Dev-container interactive setup can prompt for Amp login twice. The host login lists projects before a repository and its `devcontainer.json` exist. The second login is stored in the dev-container home volume for the runner process. GitHub CLI and SSH inside a project dev container follow that project's configuration. Put push credentials in `/amp-runner-home` when the runner must push from the container.
 
 Interactive credentials are stored by Amp in the runner's persistent home. On Linux Amp currently uses `~/.local/share/amp/secrets.json`. A container's home is a named Docker volume. Token mode stores the token under `/etc/amp-runner/secrets` and passes it to Amp at process start. Child commands can inherit that environment. Use a dedicated, revocable token and treat the agent as that identity.
+
+Codex and Claude have independent authentication flows and homes:
+
+```bash
+# Codex: codex login --device-auth
+# Claude: claude auth login
+sudo amp-runner-setup authenticate WORKSPACE_ID
+
+# Native provider Remote Control lifecycle
+sudo amp-runner-setup remote enable WORKSPACE_ID
+sudo amp-runner-setup remote status WORKSPACE_ID
+sudo amp-runner-setup remote pair CODEX_ID
+sudo amp-runner-setup remote disable WORKSPACE_ID
+
+# Run the agent TUI or a provider-specific noninteractive command
+sudo amp-runner-setup connect WORKSPACE_ID
+sudo amp-runner-setup connect CODEX_ID -- exec 'Review the current changes'
+sudo amp-runner-setup connect CLAUDE_ID -- -p 'Review the current changes'
+
+# Rotate or remove an API key without putting it in argv
+sudo amp-runner-setup credentials set WORKSPACE_ID --token-file /secure/key
+sudo amp-runner-setup credentials clear WORKSPACE_ID
+```
+
+The named home volume is mounted at `/agent-home`. Codex uses `CODEX_HOME=/agent-home/.codex`. Claude uses `CLAUDE_CONFIG_DIR=/agent-home/.claude`, following Anthropic's current guidance so OAuth state and settings survive container rebuilds. Token mode maps the read-only secret to `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` inside the agent process. Clearing a key retains any interactive login already stored in the volume.
+
+Native Remote Control requires provider account login; API keys are rejected. Claude Remote Control defaults on for interactive workspaces. Authentication also opens Claude once to satisfy Anthropic's workspace-trust requirement. Claude then runs `claude remote-control --spawn session`; the workspace appears at [claude.ai/code](https://claude.ai/code) and in the Claude mobile app. It requires a Pro, Max, Team, or Enterprise subscription. Team and Enterprise owners must enable it in Claude Code admin settings.
+
+Codex Remote Control is opt-in with `--native-remote`. Codex `0.146.0` ships experimental `remote-control start`, `stop`, and `pair` commands, which this project runs and supervises. OpenAI's public Remote documentation supports mobile control through the ChatGPT desktop app on macOS or Windows, including projects reached from that app over SSH. It does not support or guarantee direct headless Linux/container pairing as an end-user workflow. Treat the Codex integration as experimental and expect its command and pairing behavior to change. Both implementations make outbound TLS connections and open no inbound container port. Provider relays store synchronized session data under their respective data policies.
+
+Codex and Claude are installed with the vendors' native installers. Their native background updaters remain enabled on the latest channel. The host update timer also resolves current release versions, rebuilds both images, and recreates affected containers. This covers idle containers where a CLI background updater has not run recently.
 
 ## Runner Behavior
 
@@ -219,7 +260,7 @@ The agent executes tools without approval by default. Use an Amp policy plugin o
 
 ### Secure Web Workspace
 
-Each runner can have a separate LinuxServer Webtop companion. The XFCE application menu exposes Chromium, Firefox ESR, XFCE Terminal, and Thunar. Selkies provides the browser-delivered desktop and file transfer UI. The runner workspace is mounted read-write at `/workspace`; the desktop home and browser profiles persist in a separate `amp-runner-ID-desktop` Docker volume.
+Each agent workspace can have a separate LinuxServer Webtop companion. The XFCE application menu exposes Chromium, Firefox ESR, XFCE Terminal, and Thunar. Codex and Claude are available directly in the terminal for their respective workspaces. Selkies provides the browser-delivered desktop and file transfer UI. The repository is mounted read-write at `/workspace`; the desktop home and browser profiles persist in a separate `amp-runner-ID-desktop` Docker volume.
 
 Enable it during runner provisioning or later:
 
@@ -239,7 +280,7 @@ Access modes:
 - `tailscale` publishes a path such as `https://runner.example.ts.net/desktop/build-1/` through Tailscale Serve. Tailscale terminates TLS, applies tailnet access controls, and Webtop still requires its generated login. Tailscale may print a one-time consent URL when HTTPS certificates or Serve have not been enabled for the tailnet.
 - `ssh` keeps Webtop on host loopback. `desktop credentials` prints the SSH forwarding command, local HTTPS URL, and login. Webtop uses a self-signed certificate inside the encrypted tunnel.
 
-The installer never publishes the desktop on `0.0.0.0` and does not use Tailscale Funnel. The container receives no Docker socket, no privileged mode, and no runner home volume. Passwordless sudo is disabled. Anyone who can sign in still receives a terminal, browser network access, and read-write control of the repository, so grant access as carefully as shell access.
+The installer never publishes the desktop on `0.0.0.0` and does not use Tailscale Funnel. The container receives no Docker socket or privileged mode. Passwordless sudo is disabled. Codex and Claude desktops mount only that workspace's agent home and optional read-only API-key secret; Amp desktops receive no runner home. Anyone who can sign in still receives a terminal, browser network access, agent credentials, and read-write control of the repository, so grant access as carefully as shell access.
 
 This is a local desktop counterpart. It does not register as an Amp portal, attach to an orb thread, or inherit Amp-managed OIDC and secrets.
 
@@ -247,6 +288,9 @@ This is a local desktop counterpart. It does not register as an Amp portal, atta
 
 | Capability | Self-hosted runner | Notes |
 | --- | --- | --- |
+| Independent Codex and Claude workspaces | Yes | Persistent Docker home, repository, CLI/shell access, interactive login or API key |
+| Claude native Remote Control | Yes | Documented headless, outbound-only relay with account login and web/mobile sessions |
+| Codex native Remote Control | Experimental | Opt-in shipped CLI daemon and pairing command; not a publicly supported substitute for OpenAI's desktop Remote workflow |
 | Remote thread creation | Yes | Amp web, app, TUI, and plugins can target a live runner ID |
 | Web terminal | Yes | Enable per runner with `--remote-terminal` or the dashboard |
 | Secure browser workspace | Yes | Tailnet HTTPS or SSH tunnel, generated login, terminal, Chromium, Firefox, and Thunar |
@@ -268,6 +312,14 @@ sudo amp-runner-setup list
 sudo amp-runner-setup status build-1
 sudo amp-runner-setup logs build-1 --follow
 sudo amp-runner-setup restart build-1
+sudo amp-runner-setup connect codex-build-1
+sudo amp-runner-setup shell codex-build-1
+sudo amp-runner-setup authenticate codex-build-1
+sudo amp-runner-setup remote enable codex-build-1
+sudo amp-runner-setup remote status codex-build-1
+sudo amp-runner-setup remote pair codex-build-1
+sudo amp-runner-setup credentials set codex-build-1 --token-file /secure/openai-key
+sudo amp-runner-setup credentials clear codex-build-1
 sudo amp-runner-setup configure build-1 --remote-terminal
 sudo amp-runner-setup desktop enable build-1 --access tailscale
 sudo amp-runner-setup desktop status build-1
@@ -283,7 +335,7 @@ sudo amp-runner-setup remove build-1
 sudo amp-runner-setup remove build-1 --purge
 ```
 
-Each runner has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, and a 45-second stop timeout. Logs go to journald. `doctor` checks required tools, memory, disk, and every service. Amp has no documented runner readiness endpoint, so these checks only prove the process is up. They do not prove registration with Amp's service. `amp-runner-setup update` forces CLI updates, rebuilds the generic container image when needed, and restarts selected services.
+Each workspace has an `amp-runner-ID.service` unit with `Restart=always`, a five-second restart delay, and a 45-second stop timeout. Amp units run the persistent runner. Codex and Claude units run their native Remote Control server when enabled, or hold an idle container when disabled. Logs go to journald. `doctor` checks required tools, memory, disk, and every service. Amp has no documented runner readiness endpoint, so these checks only prove the process is up. They do not prove registration with Amp's service. `amp-runner-setup update` resolves the latest Codex and Claude releases, rebuilds the generic image, updates Amp, and restarts selected services.
 
 `remove` keeps workspaces and Docker home volumes by default. Retained home volumes contain Amp and Git-host credentials. `--purge` deletes them. `uninstall` removes services and this tool. Installed OS packages stay.
 
@@ -292,9 +344,9 @@ Each runner has an `amp-runner-ID.service` unit with `Restart=always`, a five-se
 Bootstrap enables `amp-runner-update.timer`. Every six hours, with a randomized delay, it:
 
 1. Checks the latest GitHub release for this repository and installs newer setup files.
-2. Runs `amp update` in every runner home.
-3. Restarts the affected runner services.
-4. Rebuilds the generic Docker and enabled web workspace images only when the setup release changed.
+2. Resolves current Codex and Claude Code releases, runs their native installers during image rebuilds, and restarts agent containers only when the image changed.
+3. Runs `amp update` in every Amp runner home.
+4. Rebuilds enabled web workspace images and restarts affected services.
 
 Amp also defaults `amp.updates.mode` to `auto`. The timer covers persistent headless runners explicitly and picks up installer, image, and browser-tool changes published by this project.
 
@@ -312,10 +364,10 @@ Set `AMP_RUNNER_UPDATE_REPOSITORY=owner/repository` when maintaining a fork with
 | --- | --- |
 | `/opt/amp-runner` | Installed setup tool and generic image source |
 | `/etc/amp-runner/instances` | Non-secret instance metadata |
-| `/etc/amp-runner/secrets` | Amp access tokens for token-authenticated services |
+| `/etc/amp-runner/secrets` | Amp, OpenAI, and Anthropic API keys for token-authenticated services |
 | `/srv/amp-runners/workspaces` | Default workspaces |
 | `/srv/amp-runners/repositories` | Base repositories used by worktree mode |
-| Docker volume `amp-runner-ID-home` | Amp, GitHub CLI, plugin, and shell state for container modes |
+| Docker volume `amp-runner-ID-home` | Amp state, or isolated Codex/Claude auth, configuration, sessions, GitHub CLI, and shell state |
 | Docker volume `amp-runner-ID-desktop` | Web workspace home, browser profiles, and XFCE settings |
 
 Override install locations with `AMP_RUNNER_INSTALL_DIR`, `AMP_RUNNER_CONFIG_DIR`, `AMP_RUNNER_DATA_DIR`, `AMP_RUNNER_IMAGE`, and `AMP_RUNNER_DESKTOP_IMAGE` when needed.
@@ -371,11 +423,13 @@ Repository validation does not modify the host:
 ./tests/test.sh
 ```
 
-It checks Bash syntax, SemVer source consistency, runner-ID and fleet parsing, project selection, help output, required security defaults, the automatic updater, and the absence of unsupported runner flags. CI also runs ShellCheck. A full Docker build is intentionally separate because it downloads several gigabytes:
+It checks Bash syntax, SemVer source consistency, workspace-ID and fleet parsing, provider state and dispatch, project selection, help output, secret handling, Codex sandbox arguments, required security defaults, and the automatic updater. CI also runs ShellCheck. A full Docker build is intentionally separate because it downloads several gigabytes:
 
 ```bash
 docker build --pull -t amp-runner:test .
 docker run --rm amp-runner:test amp --version
+docker run --rm amp-runner:test codex --version
+docker run --rm amp-runner:test claude --version
 ```
 
 ## References
@@ -383,6 +437,13 @@ docker run --rm amp-runner:test amp --version
 - [Amp Owner's Manual](https://ampcode.com/manual) (Runners, Projects, CLI, Configuration, Plugins)
 - [Amp Orbs manual](https://ampcode.com/manual/orbs)
 - [Amp security reference](https://ampcode.com/security)
+- [OpenAI Codex CLI](https://developers.openai.com/codex/cli)
+- [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
+- [OpenAI Codex remote connections](https://developers.openai.com/codex/remote-connections)
+- [OpenAI Codex secure dev-container profile](https://github.com/openai/codex/blob/main/.devcontainer/devcontainer.secure.json)
+- [Anthropic Claude Code setup](https://code.claude.com/docs/en/setup)
+- [Anthropic Claude Code Remote Control](https://code.claude.com/docs/en/remote-control)
+- [Anthropic Claude Code development containers](https://code.claude.com/docs/en/devcontainer)
 - [Release Please](https://github.com/googleapis/release-please)
 - [agent-browser](https://agent-browser.dev/installation)
 - [LinuxServer Webtop](https://docs.linuxserver.io/images/docker-webtop/)

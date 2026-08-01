@@ -33,7 +33,7 @@ apt-get install -y --no-install-recommends \
 	openjdk-21-jdk-headless maven \
 	libssl-dev libffi-dev libreadline-dev zlib1g-dev libsqlite3-dev \
 	libbz2-dev liblzma-dev libncurses-dev uuid-dev \
-	ripgrep fd-find fzf shellcheck \
+	ripgrep fd-find fzf shellcheck bubblewrap \
 	tmux vim less tree procps lsof strace iproute2 iputils-ping dnsutils netcat-openbsd \
 	sqlite3 postgresql-client redis-tools \
 	ffmpeg imagemagick xvfb \
