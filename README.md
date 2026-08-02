@@ -123,7 +123,7 @@ Cloud-init runs the noninteractive host bootstrap. Complete account login over S
 
 ```bash
 sudo amp-runner-setup
-sudo tailscale up  # only when Tailscale was requested during bootstrap
+sudo ./setup.sh bootstrap --tailscale  # cloud-init does not install Tailscale
 ```
 
 The first bootstrap usually takes 10 to 25 minutes because it installs native toolchains and builds the agent image. Watch it with:
@@ -379,9 +379,11 @@ sudo amp-runner-setup desktop rotate-password WORKSPACE_ID
 Access choices:
 
 - `tailscale` publishes `https://HOSTNAME.ts.net/desktop/WORKSPACE_ID/` through Tailscale Serve. Tailscale terminates TLS and applies tailnet policy; Webtop still requires its generated username and password. Tailscale can print a one-time consent URL when HTTPS or Serve has not been enabled for the tailnet.
+
+  Serve owns the `/desktop/WORKSPACE_ID` mount point and forwards the remainder of the path, so the container serves at its own root in both access modes. Configuring the container to expect the same prefix made it answer with its web server's default page instead of the desktop. After enabling tailnet access, `desktop enable` now fetches the real tailnet URL and reports that specific failure, because the loopback health check never traverses the proxy and passes either way.
 - `ssh` binds Webtop to host loopback. `desktop credentials` prints the SSH forwarding command, local HTTPS address, and login. Webtop's self-signed certificate remains inside the encrypted SSH tunnel.
 
-The installer never binds Webtop to `0.0.0.0` and does not use Tailscale Funnel. The desktop container receives no Docker socket or privileged mode, and passwordless `sudo` is disabled. A signed-in user still has a terminal, browser network access, repository write access, and the workspace's agent credentials. Treat browser-desktop access like shell access.
+The installer never binds Webtop to `0.0.0.0` and does not use Tailscale Funnel. The desktop container receives no Docker socket and no privileged mode. It is also started with `DISABLE_SUDO=true`, but that variable is not part of the documented LinuxServer image contract and this project does not remove `sudo` from the image, so do not rely on it as a boundary. A signed-in user has a terminal, browser network access, repository write access, and the workspace's agent credentials. Treat browser-desktop access like shell access.
 
 This desktop is provided by the project. It is not an Amp portal, does not attach to an orb thread, and does not inherit Amp-managed OIDC or secrets.
 
@@ -604,7 +606,7 @@ For a Lightsail firewall:
 
 Optional SSH hardening disables passwords, keyboard-interactive login, root login, and X11 forwarding. It refuses to continue until the administrator account has an `authorized_keys` file. Open a second key-authenticated session before enabling it. TCP forwarding remains enabled for development tunnels.
 
-Tailscale is installed from its signed Ubuntu repository. Run `sudo tailscale up` after installation. Tailscale recommends disabling key expiry only for trusted servers, with prompt key revocation after loss or compromise.
+Tailscale is installed from its signed Ubuntu repository. Bootstrap detects an existing installation and skips both the package install and `tailscale up` when the node is already authenticated and online, so re-running bootstrap to repair a host does not rewrite the keyring or re-prompt for login. On a fresh host it runs `tailscale up --ssh`, which is what makes step 4 above and the Codex SSH-host route possible. Tailscale recommends disabling key expiry only for trusted servers, with prompt key revocation after loss or compromise.
 
 ## Lightsail sizing
 

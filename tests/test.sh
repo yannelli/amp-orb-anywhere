@@ -429,6 +429,77 @@ else
 fi
 unset -f tailscale
 
+# The previous implementation matched the literal string 'handler does not exist',
+# so any upstream rewording turned remove and disable into a hard failure.
+tailscale() {
+	if [[ "$*" == 'serve status' ]]; then return 0; fi
+	printf 'error: no handler registered at that mount point\n' >&2
+	return 1
+}
+if disable_tailscale_desktop_route local; then
+	pass 'route cleanup survives reworded Tailscale errors'
+else
+	fail 'route cleanup survives reworded Tailscale errors'
+fi
+unset -f tailscale
+
+tailscale() {
+	if [[ "$*" == 'serve status' ]]; then
+		printf 'https://host.example.ts.net/desktop/local proxy https+insecure://127.0.0.1:6080\n'
+		return 0
+	fi
+	return 1
+}
+if disable_tailscale_desktop_route local; then
+	fail 'route cleanup reports a route that is still present'
+else
+	pass 'route cleanup reports a route that is still present'
+fi
+unset -f tailscale
+
+# Bootstrap doubles as the repair path, so a second run must not reinstall.
+tailscale() {
+	if [[ "$*" == 'status --json' ]]; then
+		printf '{"BackendState":"Running","Self":{"Online":true,"DNSName":"host.example.ts.net."}}\n'
+		return 0
+	fi
+	return 0
+}
+apt-get() { printf 'apt-get called\n'; }
+curl() { printf 'curl called\n'; }
+tailscale_install_output="$(install_tailscale 2>&1)"
+if grep -q 'already authenticated and online' <<< "$tailscale_install_output" && \
+	! grep -q 'apt-get called\|curl called' <<< "$tailscale_install_output"; then
+	pass 'Tailscale bootstrap detects an existing authenticated install'
+else
+	fail 'Tailscale bootstrap detects an existing authenticated install'
+fi
+unset -f tailscale apt-get curl
+
+# Tailscale Serve mounts the container at /desktop/ID and forwards the remainder.
+# Setting SUBFOLDER to the same prefix left the container serving its default page.
+desktop_run_definition="$(declare -f run_desktop)"
+if grep -q "SUBFOLDER=\$subfolder" <<< "$desktop_run_definition" && \
+	! grep -q 'subfolder="$(desktop_subfolder' <<< "$desktop_run_definition"; then
+	pass 'web workspace does not double-prefix the proxy path'
+else
+	fail 'web workspace does not double-prefix the proxy path'
+fi
+
+# The loopback probe never traverses Tailscale, so it passed either way.
+if grep -q 'Welcome to nginx' "$ROOT/setup.sh" && \
+	grep -q 'verify_tailscale_desktop_route' "$ROOT/setup.sh"; then
+	pass 'web workspace verifies the real tailnet URL'
+else
+	fail 'web workspace verifies the real tailnet URL'
+fi
+
+if grep -q 'tailscale up --ssh' "$ROOT/setup.sh"; then
+	pass 'Tailscale SSH is enabled as the documentation assumes'
+else
+	fail 'Tailscale SSH is enabled as the documentation assumes'
+fi
+
 # Match UTF-8 em dash (U+2014). Avoid $'\u2014' so macOS Bash 3.2 does not
 # treat the escape sequence as a literal search string for this file.
 em_dash="$(printf '\342\200\224')"
