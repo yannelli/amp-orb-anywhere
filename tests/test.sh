@@ -553,10 +553,64 @@ else
 	fail 'Tailscale SSH is enabled as the documentation assumes'
 fi
 
+# The panel is a root-equivalent control surface, so its boundaries are contract.
+panel_sudoers_definition="$(declare -f write_panel_sudoers)"
+if grep -q 'systemctl start amp-runner-\*.service' <<< "$panel_sudoers_definition" && \
+	grep -q 'visudo -c' <<< "$panel_sudoers_definition" && \
+	! grep -q 'setup.sh' <<< "$panel_sudoers_definition"; then
+	pass 'panel sudoers is narrow and validated'
+else
+	fail 'panel sudoers is narrow and validated'
+fi
+
+panel_unit_definition="$(declare -f write_panel_unit)"
+if grep -q "User=\$PANEL_USER" <<< "$panel_unit_definition" && \
+	! grep -q 'User=root' <<< "$panel_unit_definition"; then
+	pass 'panel service does not run as root'
+else
+	fail 'panel service does not run as root'
+fi
+
+# Binding anything but loopback would expose a root-equivalent surface.
+if grep -q "const HOST = '127.0.0.1'" "$ROOT/panel/server.mjs" && \
+	! grep -q "0\.0\.0\.0" "$ROOT/panel/server.mjs"; then
+	pass 'panel binds host loopback only'
+else
+	fail 'panel binds host loopback only'
+fi
+
+# Docker group membership is effectively host root.
+if ! grep -q "'docker'" "$ROOT/panel/server.mjs" && grep -q 'timingSafeEqual' "$ROOT/panel/server.mjs"; then
+	pass 'panel avoids Docker access and compares passwords in constant time'
+else
+	fail 'panel avoids Docker access and compares passwords in constant time'
+fi
+
+# install_tool_files is the only path that survives update and self-update.
+if grep -q 'INSTALL_DIR/panel' "$ROOT/setup.sh" && \
+	grep -q 'panel/package-lock.json' "$ROOT/setup.sh"; then
+	pass 'panel sources are installed and reproducibly built'
+else
+	fail 'panel sources are installed and reproducibly built'
+fi
+
+if grep -q 'panel/dist/' "$ROOT/.gitignore" && grep -q 'panel/node_modules/' "$ROOT/.gitignore"; then
+	pass 'panel build output stays out of version control'
+else
+	fail 'panel build output stays out of version control'
+fi
+
+if [[ -f "$ROOT/panel/package-lock.json" ]]; then
+	pass 'panel dependency lockfile is committed'
+else
+	fail 'panel dependency lockfile is committed'
+fi
+
 # Match UTF-8 em dash (U+2014). Avoid $'\u2014' so macOS Bash 3.2 does not
 # treat the escape sequence as a literal search string for this file.
 em_dash="$(printf '\342\200\224')"
-if grep -R "$em_dash" "$ROOT" --include='*.md' --include='*.sh' >/dev/null; then
+if grep -R "$em_dash" "$ROOT" --include='*.md' --include='*.sh' \
+	--exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git >/dev/null; then
 	fail 'prose contains em dash'
 else
 	pass 'prose punctuation check'

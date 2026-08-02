@@ -412,6 +412,34 @@ The installer never binds Webtop to `0.0.0.0` and does not use Tailscale Funnel.
 
 This desktop is provided by the project. It is not an Amp portal, does not attach to an orb thread, and does not inherit Amp-managed OIDC or secrets.
 
+## Control panel
+
+A local web control panel lists every workspace with its live systemd state and can start, stop, and restart them.
+
+```bash
+sudo amp-runner-setup panel enable
+sudo amp-runner-setup panel credentials
+```
+
+It is a React single-page application built at provisioning time with the Node toolchain that bootstrap already installs, so nothing prebuilt is committed. Enabling it runs `npm ci` and `npm run build` in `/opt/amp-runner/panel`, which takes a few minutes on first use.
+
+The panel is a root-equivalent control surface, so it is deliberately fenced in:
+
+- it binds host loopback only, never `0.0.0.0`, and is never published through Tailscale Funnel;
+- it runs as the dedicated `amp-panel` system account, not root;
+- its sudo policy grants exactly `systemctl start`, `stop`, and `restart` on `amp-runner-*.service` and nothing else. It cannot invoke `setup.sh`, because that script also owns `remove` and `uninstall`;
+- it is kept out of the `docker` group, which is equivalent to host root, so it reports systemd state rather than container state;
+- a generated password protects it even on loopback, compared in constant time.
+
+Reach it over an SSH tunnel, or publish it on a tailnet yourself:
+
+```bash
+ssh -N -L 7900:127.0.0.1:7900 ADMIN@HOST
+sudo tailscale serve --bg --https=443 --set-path=/panel http://127.0.0.1:7900
+```
+
+Set `AMP_RUNNER_PANEL_PORT` to move it off 7900. Ports are reserved against browser-desktop and OpenChamber allocations, so the three never collide.
+
 ## Operate workspaces
 
 ### Common commands
@@ -470,6 +498,7 @@ sudo journalctl -u amp-runner-WORKSPACE_ID.service -f
 | `/etc/amp-runner/instances` | Non-secret workspace metadata |
 | `/etc/amp-runner/secrets` | File-backed Amp, OpenAI, Anthropic, and Webtop credentials |
 | `/etc/amp-runner/shared` | Shared per-provider account logins |
+| `/opt/amp-runner/panel` | Control panel sources and build output |
 | `/srv/amp-runners/workspaces` | Default workspaces |
 | `/srv/amp-runners/repositories` | Base repositories used by worktree mode |
 | `amp-runner-WORKSPACE_ID-home` volume | Agent state, authentication, configuration, sessions, GitHub CLI, and shell state |
