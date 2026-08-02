@@ -1875,12 +1875,26 @@ run_agent_container() {
 		case "$agent" in
 		codex)
 			exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c '
-				if ! codex remote-control start; then
-					codex remote-control stop >/dev/null 2>&1 || true
-					echo "Codex experimental Remote Control could not start. Authenticate, then retry: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
-					exec sh -c '\''trap "exit 0" TERM INT; while :; do sleep 3600; done'\''
-				fi
 				trap '\''codex remote-control stop >/dev/null 2>&1 || true; exit 0'\'' TERM INT
+				announced=0
+				until codex remote-control start; do
+					codex remote-control stop >/dev/null 2>&1 || true
+					if [ "$announced" -eq 0 ]; then
+						echo "Codex experimental Remote Control could not start. It retries every 30 seconds. Authenticate with: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
+						announced=1
+					fi
+					sleep 30
+				done
+				# The daemon writes its PID file asynchronously, so give it a start
+				# window before the watchdog treats a missing file as a crash.
+				waited=0
+				while [ "$waited" -lt 60 ]; do
+					pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"
+					[ -n "$pid" ] && break
+					waited=$((waited + 1))
+					sleep 1
+				done
+				echo "Codex Remote Control is running. Pair it with: sudo amp-runner-setup remote pair $AGENT_WORKSPACE_ID" >&2
 				while :; do
 					pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"
 					[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || exit 1
@@ -1888,12 +1902,17 @@ run_agent_container() {
 				done'
 			;;
 		claude)
+			# Remote Control needs a claude.ai account token; an API key makes it refuse.
+			# claude auth status already reports JSON and exits non-zero when signed out,
+			# so use its exit status instead of parsing an assumed field name.
 			exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c '
-				if ! claude auth status --json | jq -e '\''.loggedIn == true'\'' >/dev/null; then
-					echo "Claude Remote Control is waiting for claude.ai login. Run: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
-					exec sh -c '\''trap "exit 0" TERM INT; while :; do sleep 3600; done'\''
+				unset ANTHROPIC_API_KEY
+				if ! claude auth status >/dev/null 2>&1; then
+					echo "Claude Remote Control is waiting for claude.ai login. It starts automatically once you run: sudo amp-runner-setup authenticate $AGENT_WORKSPACE_ID" >&2
+					while ! claude auth status >/dev/null 2>&1; do sleep 30; done
+					echo "Claude login detected. Starting Remote Control." >&2
 				fi
-				exec claude remote-control --name "$AGENT_WORKSPACE_ID" --spawn session'
+				exec claude remote-control --name "$AGENT_WORKSPACE_ID" --spawn same-dir'
 			;;
 		esac
 	fi
@@ -2120,15 +2139,26 @@ native_remote_status() {
 	if [[ "$(docker inspect --format '{{.State.Running}}' "amp-runner-$id" 2>/dev/null || true)" == true ]]; then
 		case "$agent" in
 		codex)
-			if docker exec "amp-runner-$id" sh -c 'pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null'; then runtime_state=running; fi
+			if docker exec "amp-runner-$id" sh -c 'pid="$(jq -r '\''.pid // empty'\'' /agent-home/.codex/app-server-daemon/app-server.pid 2>/dev/null || true)"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null'; then
+				runtime_state=running
+			elif ! docker exec "amp-runner-$id" codex login status >/dev/null 2>&1; then
+				runtime_state='awaiting login'
+			fi
 			;;
 		claude)
-			if docker exec "amp-runner-$id" pgrep -f '^/agent-home/.local/bin/claude remote-control' >/dev/null; then runtime_state=running; fi
+			if docker exec "amp-runner-$id" pgrep -f 'claude remote-control' >/dev/null 2>&1; then
+				runtime_state=running
+			elif ! docker exec "amp-runner-$id" claude auth status >/dev/null 2>&1; then
+				runtime_state='awaiting login'
+			fi
 			;;
 		esac
 	fi
 	printf 'Workspace: %s\nProvider: %s\nConfigured: %s\nService: %s\nRemote runtime: %s\n' "$id" "$agent" "$enabled" "$service_state" "$runtime_state"
-	if [[ "$agent" == codex && "$runtime_state" == running ]]; then
+	if [[ "$runtime_state" == 'awaiting login' ]]; then
+		# The container stays up and polls, so this resolves without a restart.
+		printf 'Sign in to start it: sudo amp-runner-setup authenticate %s\n' "$id"
+	elif [[ "$agent" == codex && "$runtime_state" == running ]]; then
 		printf 'Pair a device: sudo amp-runner-setup remote pair %s\n' "$id"
 	elif [[ "$agent" == claude && "$runtime_state" == running ]]; then
 		printf 'Open https://claude.ai/code or the Claude mobile app with the authenticated account.\n'
@@ -2161,7 +2191,11 @@ native_remote_command() {
 		[[ "$agent" == codex ]] || die 'Claude sessions appear directly at https://claude.ai/code and do not use a pairing command.'
 		[[ "$(native_remote_enabled "$id")" == true ]] || die "Enable native Remote Control first: sudo amp-runner-setup remote enable $id"
 		ensure_instance_running "$id"
-		docker exec --interactive "amp-runner-$id" codex remote-control pair
+		# Pairing prints a code and waits for confirmation, so it needs a TTY and the
+		# project directory, matching connect, shell, and authenticate.
+		local -a terminal=(--interactive)
+		if [[ -t 0 && -t 1 ]]; then terminal+=(--tty); fi
+		docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" codex remote-control pair
 		;;
 	*) die 'remote expects enable, disable, status, or pair.' ;;
 	esac

@@ -319,7 +319,7 @@ Provider-native Remote Control requires account login. API-key-only workspaces c
 | Workspace | Remote workflow | Status |
 | --- | --- | --- |
 | Amp | Target the live runner ID from Amp web, desktop, mobile, or another Amp client | Supported |
-| Claude Code | `claude remote-control --spawn session`, then use [claude.ai/code](https://claude.ai/code) or the Claude mobile app | Supported headless research preview |
+| Claude Code | `claude remote-control --name WORKSPACE_ID --spawn same-dir`, then use [claude.ai/code](https://claude.ai/code) or the Claude mobile app | Supported headless research preview |
 | Codex | `codex remote-control start`, `stop`, and `pair` inside the workspace container | Experimental |
 
 Manage native provider control with:
@@ -333,7 +333,21 @@ sudo amp-runner-setup remote disable WORKSPACE_ID
 
 Claude Remote Control is enabled by default for interactive Claude workspaces. The authentication flow opens Claude once to satisfy the workspace-trust prompt. Remote Control requires a Pro, Max, Team, or Enterprise subscription. Team and Enterprise owners must allow it in Claude Code administration settings.
 
+The server runs in the upstream default `same-dir` spawn mode, so several devices can hold sessions against the workspace at once. `--spawn session` serves exactly one session and rejects further connections, which is why it is not used here.
+
+Remote Control needs a claude.ai account token. It refuses to start when `ANTHROPIC_API_KEY` is set, so the launcher keeps API keys away from `claude remote-control` and `claude auth`. An API-key-only workspace cannot use Remote Control at all.
+
+A workspace provisioned without a terminal has no login yet. Rather than idling, the container polls every 30 seconds and starts Remote Control as soon as `authenticate` succeeds, with no restart needed. `remote status` reports `awaiting login` until then.
+
 Codex Remote Control is opt-in. This project supervises the `remote-control` commands currently shipped by Codex, but OpenAI's public remote documentation describes mobile control through the Codex desktop app on macOS or Windows, including projects reached from that app over SSH. OpenAI does not guarantee direct headless Linux or container pairing as an end-user workflow. Expect the experimental command and pairing behavior to change.
+
+Starting `codex remote-control start` is not the same as being visible in the Codex app. Pairing is a separate step and nothing runs it for you:
+
+```bash
+sudo amp-runner-setup remote pair CODEX_WORKSPACE_ID
+```
+
+If pairing a headless container does not surface the workspace, use the route OpenAI documents instead: reach this host over Tailscale SSH and add it in the Codex app under Settings, Connections, Add SSH Host, then select the workspace directory. The app starts its own `codex app-server` over that SSH connection. Do not expose the app server on a public network; a tailnet is the recommended transport.
 
 Both provider relays use outbound TLS and open no inbound container port. Synchronized sessions remain subject to the provider's data policy.
 
@@ -409,7 +423,8 @@ There is no restart-attempt limit. A failed process or container is recreated af
 
 - Amp runs as the foreground service process, so an Amp CLI crash exits the unit and triggers restart.
 - Claude Code Remote Control runs as the foreground container process, so its exit triggers restart.
-- Codex Remote Control starts a background daemon. The supervisor checks its daemon PID every 30 seconds; a missing daemon exits the container and triggers restart.
+- Codex Remote Control starts a background daemon. The supervisor waits up to 60 seconds for the daemon to write its PID file, then checks its daemon PID every 30 seconds; a missing daemon exits the container and triggers restart. Without that start window the first check could fire before the daemon had written the file and crash-loop the container.
+- A provider that cannot start because nobody has signed in yet does not crash-loop. The container polls every 30 seconds and starts the remote server as soon as the login succeeds.
 - Workspaces without a provider-native remote server intentionally keep an idle foreground container online until `connect`, `shell`, or the browser desktop starts a CLI.
 
 This watchdog detects dead processes. Amp, Codex, and Claude Code do not expose a stable local health endpoint that proves provider connectivity or successful task processing. A process that remains alive while hung is not restarted. `doctor` verifies tools, memory, disk, and process state; it does not prove that an Amp runner is registered or that a provider can accept work.

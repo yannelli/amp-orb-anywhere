@@ -259,6 +259,71 @@ else
 	fail 'provider CLI, trust, login, and remote commands'
 fi
 
+agent_container_definition="$(declare -f run_agent_container)"
+
+# claude auth status already reports JSON and exits non-zero when signed out. The old
+# gate piped an undocumented --json flag into jq and read an assumed .loggedIn field,
+# so any mismatch inverted through ! and parked the container in an endless sleep.
+if ! grep -q 'claude auth status --json' "$ROOT/setup.sh" && \
+	! grep -q 'loggedIn' "$ROOT/setup.sh" && \
+	grep -q 'claude auth status >/dev/null 2>&1' <<< "$agent_container_definition"; then
+	pass 'Claude login gate uses the documented exit status'
+else
+	fail 'Claude login gate uses the documented exit status'
+fi
+
+# A workspace waiting for its first login must keep polling instead of idling forever
+# or crash-looping against RestartSec=5s.
+# 'exec sh -c ... sleep 3600' was how a provider that could not start parked itself
+# permanently. The idle fall-through for workspaces without a remote server is a
+# separate 'exec docker run' and stays.
+if grep -q 'while ! claude auth status' <<< "$agent_container_definition" && \
+	grep -q 'until codex remote-control start' <<< "$agent_container_definition" && \
+	! grep -q 'exec sh -c' <<< "$agent_container_definition"; then
+	pass 'remote control waits for login instead of idling'
+else
+	fail 'remote control waits for login instead of idling'
+fi
+
+# --spawn session serves exactly one session and rejects further connections.
+if grep -q -- '--spawn same-dir' <<< "$agent_container_definition" && \
+	! grep -q -- 'remote-control.*--spawn session' "$ROOT/setup.sh"; then
+	pass 'Claude Remote Control accepts more than one connection'
+else
+	fail 'Claude Remote Control accepts more than one connection'
+fi
+
+# The daemon writes its PID file asynchronously; checking at t=0 crash-looped.
+if grep -q 'waited=0' <<< "$agent_container_definition" && \
+	grep -q -- '-lt 60' <<< "$agent_container_definition"; then
+	pass 'Codex watchdog allows a daemon start window'
+else
+	fail 'Codex watchdog allows a daemon start window'
+fi
+
+remote_command_definition="$(declare -f native_remote_command)"
+if grep -q -- '--workdir /workspace "amp-runner-$id" codex remote-control pair' <<< "$remote_command_definition" && \
+	grep -q 'terminal+=(--tty)' <<< "$remote_command_definition"; then
+	pass 'Codex pairing runs on a terminal in the project directory'
+else
+	fail 'Codex pairing runs on a terminal in the project directory'
+fi
+
+# Remote Control refuses to start when ANTHROPIC_API_KEY is set.
+if grep -q 'claude_wants_account_auth' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q 'remote-control | --remote-control | --rc' "$ROOT/scripts/agent-cli-launcher"; then
+	pass 'launcher keeps API keys away from Remote Control'
+else
+	fail 'launcher keeps API keys away from Remote Control'
+fi
+
+if grep -q "runtime_state='awaiting login'" "$ROOT/setup.sh" && \
+	grep -q 'Sign in to start it' "$ROOT/setup.sh"; then
+	pass 'remote status distinguishes awaiting login from inactive'
+else
+	fail 'remote status distinguishes awaiting login from inactive'
+fi
+
 if grep -q 'OPENAI_API_KEY="$(cat /run/secrets/agent_api_key)"' "$ROOT/scripts/agent-cli-launcher" && \
 	grep -q 'ANTHROPIC_API_KEY="$(cat /run/secrets/agent_api_key)"' "$ROOT/scripts/agent-cli-launcher" && \
 	grep -q 'CODEX_HOME=.*\.codex' "$ROOT/scripts/agent-cli-launcher" && \
