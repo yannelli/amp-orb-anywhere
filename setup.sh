@@ -6,6 +6,7 @@ INSTALL_DIR="${AMP_RUNNER_INSTALL_DIR:-/opt/amp-runner}"
 CONFIG_DIR="${AMP_RUNNER_CONFIG_DIR:-/etc/amp-runner}"
 STATE_DIR="$CONFIG_DIR/instances"
 SECRET_DIR="$CONFIG_DIR/secrets"
+SHARED_AUTH_DIR="$CONFIG_DIR/shared"
 DATA_DIR="${AMP_RUNNER_DATA_DIR:-/srv/amp-runners}"
 IMAGE="${AMP_RUNNER_IMAGE:-amp-runner:ubuntu24.04}"
 DESKTOP_IMAGE="${AMP_RUNNER_DESKTOP_IMAGE:-amp-runner-desktop:debian-xfce}"
@@ -171,6 +172,12 @@ native_remote_enabled() {
 	jq -r '.nativeRemote // false' "$(state_file "$1")"
 }
 
+# Legacy state files predate shared auth, so they keep their isolated per-workspace
+# credentials until the workspace is recreated.
+shared_auth_enabled() {
+	jq -r '.sharedAuth // false' "$(state_file "$1")"
+}
+
 ensure_add_resources_available() {
 	local id="$1" path
 	for path in \
@@ -181,6 +188,11 @@ ensure_add_resources_available() {
 		"/etc/systemd/system/$(desktop_service_name "$id").service"; do
 		[[ ! -e "$path" ]] || die "Runner ID $id has orphaned resources at $path. Remove or rename them before retrying."
 	done
+	# docker volume create is idempotent, so without this check a recycled ID would
+	# silently inherit the previous workspace's credentials and session history.
+	if docker volume inspect "amp-runner-${id}-home" >/dev/null 2>&1; then
+		die "Runner ID $id has an orphaned Docker volume amp-runner-${id}-home. Remove it with 'docker volume rm amp-runner-${id}-home' or rename the workspace before retrying."
+	fi
 	if docker container inspect "amp-runner-$id" >/dev/null 2>&1 || docker container inspect "$(desktop_service_name "$id")" >/dev/null 2>&1; then
 		die "Runner ID $id has an orphaned Docker container. Remove or rename it before retrying."
 	fi
@@ -270,7 +282,7 @@ as_user() {
 
 ensure_layout() {
 	install -d -m 0755 "$INSTALL_DIR" "$STATE_DIR" "$DATA_DIR" "$DATA_DIR/workspaces" "$DATA_DIR/repositories" "$DATA_DIR/devcontainer-data"
-	install -d -m 0700 "$SECRET_DIR"
+	install -d -m 0700 "$SECRET_DIR" "$SHARED_AUTH_DIR"
 }
 
 install_tool_files() {
@@ -555,6 +567,14 @@ run_desktop() {
 		if [[ "$(state_value "$id" '.auth')" == token ]]; then
 			key="$(token_path "$id")"
 			args+=(--mount "type=bind,source=$key,target=/run/secrets/agent_api_key,readonly")
+		fi
+		# The desktop runs the same provider CLIs, so it needs the same login the
+		# headless workspace uses or the user would be prompted a second time.
+		if [[ "$(shared_auth_enabled "$id")" == true ]]; then
+			shared_auth_args "$provider"
+			if ((${#SHARED_AUTH_ARGS[@]})); then
+				args+=("${SHARED_AUTH_ARGS[@]}")
+			fi
 		fi
 	fi
 	if [[ "$provider" == codex ]]; then
@@ -921,6 +941,53 @@ store_token() {
 	)
 }
 
+shared_auth_dir() {
+	printf '%s/%s' "$SHARED_AUTH_DIR" "$1"
+}
+
+# Container-side configuration directory each provider CLI reads. These match the
+# CODEX_HOME and CLAUDE_CONFIG_DIR values exported by scripts/agent-cli-launcher.
+provider_config_target() {
+	case "$1" in
+	codex) printf '/agent-home/.codex' ;;
+	claude) printf '/agent-home/.claude' ;;
+	*) return 1 ;;
+	esac
+}
+
+ensure_shared_auth_dir() {
+	local provider="$1" path
+	provider_config_target "$provider" >/dev/null || return 1
+	path="$(shared_auth_dir "$provider")"
+	install -d -m 0700 "$path"
+	# The provider CLIs write these credentials as the container's uid 1000.
+	[[ "$(id -u)" -ne 0 ]] || chown 1000:1000 "$path"
+	printf '%s' "$path"
+}
+
+# A shared store counts as authenticated once the provider CLI has written anything
+# into it. This avoids guessing undocumented credential file names.
+shared_auth_present() {
+	local path
+	path="$(shared_auth_dir "$1")"
+	[[ -d "$path" ]] || return 1
+	[[ -n "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+}
+
+shared_auth_args() {
+	local provider="$1" path target
+	SHARED_AUTH_ARGS=()
+	[[ "$provider" != amp ]] || return 0
+	target="$(provider_config_target "$provider")" || return 0
+	path="$(ensure_shared_auth_dir "$provider")" || return 0
+	SHARED_AUTH_ARGS=(--mount "type=bind,source=$path,target=$target")
+	# The Codex app-server daemon records a PID that is only meaningful inside its own
+	# container. Keep it per-container so co-tenant workspaces cannot read each other's.
+	if [[ "$provider" == codex ]]; then
+		SHARED_AUTH_ARGS+=(--tmpfs "$target/app-server-daemon:uid=1000,gid=1000,mode=0700")
+	fi
+}
+
 container_common_args() {
 	local id="$1" workspace="$2" home_volume="$3" key="$4"
 	CONTAINER_ARGS=(--rm --volume "$home_volume:/home/amp" --volume "$workspace:/workspace" --workdir /workspace)
@@ -931,18 +998,27 @@ container_common_args() {
 }
 
 container_agent_common_args() {
-	local id="$1" workspace="$2" home_volume="$3" provider="$4" key="$5"
+	local id="$1" workspace="$2" home_volume="$3" provider="$4" key="$5" shared="${6:-false}"
 	CONTAINER_ARGS=(--rm --volume "$home_volume:/agent-home" --volume "$workspace:/workspace" --workdir /workspace)
+	# The image ships HOME=/home/amp, which no volume covers. Without this every plain
+	# docker exec would write to the container layer and lose it on the next restart.
+	CONTAINER_ARGS+=(--env HOME=/agent-home)
 	CONTAINER_ARGS+=(--label "amp.runner.id=$id" --label "amp.agent.provider=$provider")
 	if [[ -n "$key" ]]; then
 		CONTAINER_ARGS+=(--mount "type=bind,source=$key,target=/run/secrets/agent_api_key,readonly")
 	fi
+	if [[ "$shared" == true ]]; then
+		shared_auth_args "$provider"
+		if ((${#SHARED_AUTH_ARGS[@]})); then
+			CONTAINER_ARGS+=("${SHARED_AUTH_ARGS[@]}")
+		fi
+	fi
 }
 
 container_agent_interactive() {
-	local id="$1" workspace="$2" home_volume="$3" provider="$4"
-	shift 4
-	container_agent_common_args "$id" "$workspace" "$home_volume" "$provider" ''
+	local id="$1" workspace="$2" home_volume="$3" provider="$4" shared="$5"
+	shift 5
+	container_agent_common_args "$id" "$workspace" "$home_volume" "$provider" '' "$shared"
 	docker run --interactive --tty "${CONTAINER_ARGS[@]}" "$IMAGE" "$provider" "$@"
 }
 
@@ -1010,18 +1086,22 @@ list_github_repositories() {
 }
 
 authenticate_agent_container() {
-	local provider="$1" id="$2" workspace="$3" volume="$4" auth="$5"
+	local provider="$1" id="$2" workspace="$3" volume="$4" auth="$5" shared="${6:-false}"
 	[[ "$auth" == interactive ]] || return 0
+	if [[ "$shared" == true ]] && shared_auth_present "$provider"; then
+		say "Reusing the shared $provider login. Re-authenticate with: sudo amp-runner-setup authenticate $id"
+		return 0
+	fi
 	if ! have_tty; then
 		say "Interactive $provider login skipped without a terminal. Run: sudo amp-runner-setup authenticate $id"
 		return 0
 	fi
 	case "$provider" in
-	codex) container_agent_interactive "$id" "$workspace" "$volume" codex login --device-auth ;;
+	codex) container_agent_interactive "$id" "$workspace" "$volume" "$shared" codex login --device-auth ;;
 	claude)
-		container_agent_interactive "$id" "$workspace" "$volume" claude auth login
+		container_agent_interactive "$id" "$workspace" "$volume" "$shared" claude auth login
 		say 'Claude will open once so you can accept workspace trust. Exit Claude after accepting.'
-		container_agent_interactive "$id" "$workspace" "$volume" claude
+		container_agent_interactive "$id" "$workspace" "$volume" "$shared" claude
 		;;
 	esac
 }
@@ -1068,7 +1148,6 @@ ensure_container_github_auth() {
 		container_common_args "$id" "$workspace" "$volume" ''
 	else
 		container_agent_common_args "$id" "$workspace" "$volume" "$provider" ''
-		CONTAINER_ARGS+=(--env HOME=/agent-home)
 	fi
 	if docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth status --hostname github.com >/dev/null 2>&1; then
 		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" gh auth setup-git --hostname github.com
@@ -1117,7 +1196,6 @@ prepare_container_checkout() {
 		container_common_args "$id" "$workspace" "$volume" "$key"
 	else
 		container_agent_common_args "$id" "$workspace" "$volume" "$provider" "$key"
-		CONTAINER_ARGS+=(--env HOME=/agent-home)
 	fi
 	checkout_args=("${CONTAINER_ARGS[@]}")
 	if [[ -d "$workspace/.git" || -f "$workspace/.git" ]]; then
@@ -1140,7 +1218,6 @@ prepare_container_checkout() {
 				container_common_args "$id" "$(dirname "$workspace")" "$volume" ''
 			else
 				container_agent_common_args "$id" "$(dirname "$workspace")" "$volume" "$provider" ''
-				CONTAINER_ARGS+=(--env HOME=/agent-home)
 			fi
 			docker run "${CONTAINER_ARGS[@]}" "$IMAGE" git clone "$remote" "$(basename "$workspace")"
 		fi
@@ -1232,14 +1309,15 @@ prepare_devcontainer_amp() {
 }
 
 write_state() {
-	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}" agent="${11:-amp}" native_remote="${12:-false}"
+	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}" agent="${11:-amp}" native_remote="${12:-false}" shared_auth="${13:-false}"
 	jq -n \
 		--arg id "$id" --arg mode "$mode" --arg user "$user" --arg workspace "$workspace" \
 		--arg project "$project_ref" --arg repositoryURL "$remote" --arg auth "$auth" --arg agent "$agent" \
 		--arg service "$(service_name "$id")" --arg dockerAccess "$docker_access" \
 		--arg baseRepository "$base_repo" --argjson remoteTerminal "$remote_terminal" --argjson nativeRemote "$native_remote" \
+		--argjson sharedAuth "$shared_auth" \
 		--arg createdAt "$(date --iso-8601=seconds)" \
-		'{id:$id,agent:$agent,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,nativeRemote:$nativeRemote,desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
+		'{id:$id,agent:$agent,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,nativeRemote:$nativeRemote,sharedAuth:$sharedAuth,desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
 		> "$(state_file "$id")"
 	chmod 0644 "$(state_file "$id")"
 }
@@ -1289,10 +1367,12 @@ add_instance() {
 	[[ -f "$CONFIG_DIR/.bootstrapped" ]] || die 'Run sudo amp-runner-setup bootstrap first.'
 
 	local agent='' mode='' id='' auth='' token='' token_file='' requested_project='' requested_repository='' workspace='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
-	local desktop='' desktop_access=''
+	local desktop='' desktop_access='' shared_auth=''
 	while (($#)); do
 		case "$1" in
 		--agent) agent="$2"; shift ;;
+		--shared-auth) shared_auth=true ;;
+		--isolated-auth) shared_auth=false ;;
 		--mode) mode="$2"; shift ;;
 		--id) id="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
@@ -1445,6 +1525,14 @@ add_instance() {
 	if [[ "$desktop" == true ]]; then
 		case "$desktop_access" in tailscale | ssh) ;; *) die '--desktop-access must be tailscale or ssh.' ;; esac
 	fi
+	# Shared auth is a provider config-directory mount, so it only applies to the
+	# account-login Codex and Claude workspaces. API keys stay per-workspace files.
+	if [[ "$agent" == amp || "$auth" == token ]]; then
+		[[ "$shared_auth" != true ]] || die '--shared-auth is for account-authenticated Codex and Claude workspaces.'
+		shared_auth=false
+	elif [[ -z "$shared_auth" ]]; then
+		shared_auth=true
+	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
 	if [[ "$agent" != amp && "$docker_access" != none ]]; then
 		die 'Docker socket access is not supported for Codex or Claude workspaces.'
@@ -1463,7 +1551,7 @@ add_instance() {
 		;;
 	docker)
 		prepare_container_checkout "$id" "$workspace" "$volume" "$key" "$project_ref" "$remote" "$clone_repo" "$agent" "$user"
-		if [[ "$agent" != amp ]]; then authenticate_agent_container "$agent" "$id" "$workspace" "$volume" "$auth"; fi
+		if [[ "$agent" != amp ]]; then authenticate_agent_container "$agent" "$id" "$workspace" "$volume" "$auth" "$shared_auth"; fi
 		;;
 	devcontainer)
 		prepare_host_checkout "$user" "$workspace" "$project_ref" "$remote" "$clone_repo"
@@ -1479,7 +1567,7 @@ add_instance() {
 		;;
 	esac
 
-	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo" "$agent" "$native_remote"
+	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo" "$agent" "$native_remote" "$shared_auth"
 	write_unit "$id" "$mode" "$user" "$auth" "$agent"
 	if [[ "$desktop" == true ]]; then enable_desktop "$id" --access "$desktop_access"; fi
 	ADD_TRANSACTION_ACTIVE=false
@@ -1525,11 +1613,13 @@ provision_instances() {
 	PROVISION_TEMP_TOKEN_FILE=''
 
 	local agent='' mode='' auth='' token_file='' generated_token_file='' token='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
-	local desktop='' desktop_access=''
+	local desktop='' desktop_access='' shared_auth=''
 	local -a requested_specs=()
 	while (($#)); do
 		case "$1" in
 		--agent) agent="$2"; shift ;;
+		--shared-auth) shared_auth=true ;;
+		--isolated-auth) shared_auth=false ;;
 		--mode) mode="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
 		--token-file) token_file="$2"; shift ;;
@@ -1613,6 +1703,13 @@ provision_instances() {
 	if [[ "$desktop" == true ]]; then
 		case "$desktop_access" in tailscale | ssh) ;; *) die '--desktop-access must be tailscale or ssh.' ;; esac
 	fi
+	# Shared auth is what makes a fleet a one-login operation instead of one login per runner.
+	if [[ "$agent" == amp || "$auth" == token ]]; then
+		[[ "$shared_auth" != true ]] || die '--shared-auth is for account-authenticated Codex and Claude workspaces.'
+		shared_auth=false
+	elif [[ -z "$shared_auth" ]]; then
+		shared_auth=true
+	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
 	if [[ "$agent" != amp && "$docker_access" != none ]]; then
 		die 'Docker socket access is not supported for Codex or Claude workspaces.'
@@ -1679,6 +1776,11 @@ provision_instances() {
 	done
 	if [[ "$desktop" == true ]]; then printf '  %-32s %s\n' 'Web workspace' "$desktop_access access for every runner"; fi
 	if [[ "$native_remote" == true ]]; then printf '  %-32s %s\n' 'Native Remote Control' "enabled for every $agent workspace"; fi
+	if [[ "$shared_auth" == true ]]; then
+		printf '  %-32s %s\n' 'Authentication' "one shared $agent login for the whole fleet"
+	elif [[ "$auth" == interactive ]]; then
+		printf '  %-32s %s\n' 'Authentication' "a separate $agent login for every runner"
+	fi
 	if have_tty; then
 		if ! ui_confirm 'Create this agent fleet?' yes; then
 			if [[ -n "$generated_token_file" ]]; then
@@ -1703,6 +1805,7 @@ provision_instances() {
 			if [[ "$clone_repo" == true ]]; then add_args+=(--clone); else add_args+=(--no-clone); fi
 			if [[ "$remote_terminal" == true ]]; then add_args+=(--remote-terminal); else add_args+=(--no-remote-terminal); fi
 			if [[ "$native_remote" == true ]]; then add_args+=(--native-remote); else add_args+=(--no-native-remote); fi
+			if [[ "$shared_auth" == true ]]; then add_args+=(--shared-auth); else add_args+=(--isolated-auth); fi
 			if [[ "$desktop" == true ]]; then add_args+=(--desktop --desktop-access "$desktop_access"); else add_args+=(--no-desktop); fi
 			add_instance "${add_args[@]}"
 		done
@@ -1747,16 +1850,17 @@ run_host_instance() {
 }
 
 run_agent_container() {
-	local agent="$1" id="$2" workspace volume name network key='' native_remote
+	local agent="$1" id="$2" workspace volume name network key='' native_remote shared_auth
 	workspace="$(state_value "$id" '.workspace')"
 	volume="amp-runner-${id}-home"
 	name="amp-runner-$id"
 	network="amp-runner-$id"
 	native_remote="$(native_remote_enabled "$id")"
+	shared_auth="$(shared_auth_enabled "$id")"
 	[[ "$(state_value "$id" '.auth')" == token ]] && key="$(token_path "$id")"
 	docker rm --force "$name" >/dev/null 2>&1 || true
 	docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
-	container_agent_common_args "$id" "$workspace" "$volume" "$agent" "$key"
+	container_agent_common_args "$id" "$workspace" "$volume" "$agent" "$key" "$shared_auth"
 	CONTAINER_ARGS+=(--name "$name" --network "$network" --init --stop-timeout 30 --cap-drop ALL --pids-limit 4096)
 	if [[ "$agent" == codex ]]; then
 		# Codex's Linux sandbox uses bubblewrap namespaces. These are narrower than --privileged,
@@ -1978,6 +2082,9 @@ authenticate_agent_instance() {
 			docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" claude
 			;;
 	esac
+	if [[ "$(shared_auth_enabled "$id")" == true ]]; then
+		say "This login is shared with every workspace that uses the shared $agent credentials."
+	fi
 	if [[ "$(native_remote_enabled "$id")" == true ]]; then
 		systemctl restart "$(service_name "$id").service"
 		say "Restarted $id with native Remote Control."
@@ -2363,6 +2470,19 @@ remove_instance() {
 	rm -f "$file"
 	systemctl daemon-reload
 	say "Removed agent workspace $id."
+	if [[ "$purge" != --purge ]]; then
+		# The state file is gone, so list and status can no longer surface these.
+		# Name them now or they become unreclaimable disk nobody remembers.
+		say 'Retained, and no longer listed by this tool:'
+		say "  workspace  $workspace"
+		if [[ "$mode" == docker || "$mode" == devcontainer ]]; then
+			say "  volume     amp-runner-${id}-home"
+			say "Reclaim both: sudo rm -rf --one-file-system $workspace && docker volume rm amp-runner-${id}-home"
+		else
+			say "Reclaim: sudo rm -rf --one-file-system $workspace"
+		fi
+		say "Reusing the ID $id requires reclaiming them first."
+	fi
 }
 
 uninstall_tool() {
@@ -2432,6 +2552,7 @@ Add options:
   --clone | --no-clone
   --remote-terminal | --no-remote-terminal
   --native-remote | --no-native-remote
+  --shared-auth | --isolated-auth
   --desktop | --no-desktop
   --desktop-access tailscale|ssh
   --docker-access none|socket
@@ -2445,6 +2566,12 @@ headless Remote Control. Codex exposes an experimental, opt-in CLI daemon that
 is not a supported replacement for OpenAI's desktop Remote workflow. Amp also
 supports host, worktree, and devcontainer modes. API keys are stored in root-only
 files and mounted as read-only runtime secrets, never saved in state or argv.
+
+Account-authenticated Codex and Claude workspaces share one login per provider by
+default, so a fleet is authenticated once instead of once per runner. The shared
+credentials live in a root-only directory that is mounted into each workspace at
+the provider's own configuration path. Pass --isolated-auth to give a workspace
+its own credentials, which is the right choice for an untrusted repository.
 
 Run without a command for the terminal menu.
 EOF

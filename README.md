@@ -276,7 +276,26 @@ Authenticate a workspace with its provider account:
 sudo amp-runner-setup authenticate WORKSPACE_ID
 ```
 
-The login is stored in that workspace's `/agent-home` volume. Codex uses `CODEX_HOME=/agent-home/.codex`. Claude Code uses `CLAUDE_CONFIG_DIR=/agent-home/.claude`. Settings, OAuth state, and session history survive image and container replacement.
+Codex uses `CODEX_HOME=/agent-home/.codex`. Claude Code uses `CLAUDE_CONFIG_DIR=/agent-home/.claude`. Settings, OAuth state, and session history survive image and container replacement.
+
+### One login for a fleet
+
+Account-authenticated Codex and Claude Code workspaces share one login per provider by default. The credentials live in a root-only directory under `/etc/amp-runner/shared/PROVIDER` that is mounted into each workspace at the provider's own configuration path. Authenticate once and every current and future workspace for that provider is signed in:
+
+```bash
+sudo amp-runner-setup provision --agent claude --repository acme/api=5
+# one claude auth login, five workspaces
+```
+
+Because the mount is the provider's live configuration directory rather than a copy, a token refreshed in one workspace stays valid in all of them. Codex keeps its Remote Control daemon PID file on a per-container `tmpfs`, so co-tenant workspaces cannot read each other's runtime state.
+
+Give a workspace its own credentials with `--isolated-auth`:
+
+```bash
+sudo amp-runner-setup add --agent codex --isolated-auth
+```
+
+Shared credentials are a deliberate trade. Any workspace that can reach them can act as that provider account, so one compromised repository reaches every other workspace's account access. Use `--isolated-auth` for an untrusted repository, and a separate VM when workspaces must be mutually unreachable. Workspaces created before this release keep their existing isolated credentials until they are recreated.
 
 ### Use API keys
 
@@ -408,12 +427,17 @@ sudo journalctl -u amp-runner-WORKSPACE_ID.service -f
 | `/opt/amp-runner` | Installed manager and image sources |
 | `/etc/amp-runner/instances` | Non-secret workspace metadata |
 | `/etc/amp-runner/secrets` | File-backed Amp, OpenAI, Anthropic, and Webtop credentials |
+| `/etc/amp-runner/shared` | Shared per-provider account logins |
 | `/srv/amp-runners/workspaces` | Default workspaces |
 | `/srv/amp-runners/repositories` | Base repositories used by worktree mode |
 | `amp-runner-WORKSPACE_ID-home` volume | Agent state, authentication, configuration, sessions, GitHub CLI, and shell state |
 | `amp-runner-WORKSPACE_ID-desktop` volume | Desktop home, browser profiles, and XFCE settings |
 
-`remove` retains workspaces and Docker home volumes. `remove --purge` deletes them. Retained volumes can contain agent and Git-host credentials. `uninstall` removes services and the manager but leaves operating-system packages installed.
+Agent containers run with `HOME=/agent-home` so anything a shell or `docker exec` writes to the home directory lands in that volume. The container's own filesystem is discarded on every restart, so packages installed at runtime outside `/workspace` and `/agent-home` do not survive.
+
+The agent CLIs are installed into the home volume rather than the image, which is why `update` reruns the vendor installers inside the volume. Deleting the volume removes the CLI installation and the login together.
+
+`remove` retains workspaces and Docker home volumes, prints where they are, and refuses to reuse that workspace ID until they are reclaimed. `remove --purge` deletes them. Retained volumes can contain agent and Git-host credentials. `uninstall` removes services and the manager but leaves operating-system packages installed.
 
 Override install paths with `AMP_RUNNER_INSTALL_DIR`, `AMP_RUNNER_CONFIG_DIR`, `AMP_RUNNER_DATA_DIR`, `AMP_RUNNER_IMAGE`, and `AMP_RUNNER_DESKTOP_IMAGE`.
 
@@ -549,6 +573,8 @@ Codex requires an exception to the default container profile. Its current Linux 
 Amp executes tools without approval by default. Use an Amp policy plugin or permissions configuration where a repository needs command restrictions. Policy running under the same account cannot contain malicious code that already has host execution.
 
 Interactive Amp credentials live in the runner's persistent home, currently under `~/.local/share/amp/secrets.json` on Linux. File-backed keys live under `/etc/amp-runner/secrets` with mode `0400`. Child commands launched by an agent can inherit its environment. Use dedicated, revocable, least-privilege credentials.
+
+Codex and Claude Code account logins are shared across workspaces by default and live under `/etc/amp-runner/shared` with mode `0700`. That is one credential boundary for every workspace using the same provider, so it does not separate organizations or trust levels. Pass `--isolated-auth` to keep a workspace's credentials to itself, and put mutually untrusted repositories on separate VMs.
 
 ## Networking and SSH
 

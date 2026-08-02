@@ -117,6 +117,17 @@ else
 fi
 rm -f "$(token_path collision-test)"
 
+# A recycled ID must not silently inherit the previous workspace's credentials.
+docker() {
+	[[ "$*" == 'volume inspect amp-runner-volume-collision-home' ]]
+}
+if (ensure_add_resources_available volume-collision) >/dev/null 2>&1; then
+	fail 'add rejects an orphaned home volume'
+else
+	pass 'add rejects an orphaned home volume'
+fi
+unset -f docker
+
 github_projects="$(
 	as_user() {
 		printf '%s\n' '{"id":"123","namespace":"acme","name":"api","repositoryURL":"https://github.com/acme/api.git"}'
@@ -134,6 +145,53 @@ if printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq 'type=bind,source=/tmp/provi
 else
 	fail 'provider home and file-backed secret mounts'
 fi
+
+SHARED_AUTH_DIR="$state_root/shared"
+container_agent_common_args codex-test /tmp/work agent-home codex '' true
+if printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq "type=bind,source=$SHARED_AUTH_DIR/codex,target=/agent-home/.codex" && \
+	printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq '/agent-home/.codex/app-server-daemon:uid=1000,gid=1000,mode=0700' && \
+	[[ "$(stat -c '%a' "$SHARED_AUTH_DIR/codex")" == 700 ]]; then
+	pass 'shared auth mounts the provider config directory with a private daemon path'
+else
+	fail 'shared auth mounts the provider config directory with a private daemon path'
+fi
+
+container_agent_common_args claude-test /tmp/work agent-home claude '' true
+if printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq "type=bind,source=$SHARED_AUTH_DIR/claude,target=/agent-home/.claude" && \
+	! printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -q 'app-server-daemon'; then
+	pass 'shared auth maps the Claude configuration directory'
+else
+	fail 'shared auth maps the Claude configuration directory'
+fi
+
+container_agent_common_args codex-test /tmp/work agent-home codex '' false
+if ! printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -q "$SHARED_AUTH_DIR"; then
+	pass 'isolated auth keeps credentials in the per-workspace volume'
+else
+	fail 'isolated auth keeps credentials in the per-workspace volume'
+fi
+
+if printf '%s\n' "${CONTAINER_ARGS[@]}" | grep -Fxq 'HOME=/agent-home'; then
+	pass 'agent containers pin HOME to the persistent volume'
+else
+	fail 'agent containers pin HOME to the persistent volume'
+fi
+
+if shared_auth_present codex; then
+	fail 'an empty shared store does not count as authenticated'
+else
+	pass 'an empty shared store does not count as authenticated'
+fi
+printf 'token\n' > "$SHARED_AUTH_DIR/codex/auth.json"
+if shared_auth_present codex; then
+	pass 'a populated shared store skips repeat logins'
+else
+	fail 'a populated shared store skips repeat logins'
+fi
+
+write_state shared-state docker tester /tmp/shared-work acme/api https://github.com/acme/api interactive false none '' codex true true
+assert_equal 'true' "$(shared_auth_enabled shared-state)" 'shared auth state serialization'
+assert_equal 'false' "$(shared_auth_enabled local)" 'legacy state keeps isolated credentials'
 
 assert_equal '/desktop/local/' "$(desktop_subfolder local)" 'desktop reverse-proxy path'
 assert_equal 'false' "$(desktop_state_value local '.desktop.enabled' false)" 'legacy state desktop default'
