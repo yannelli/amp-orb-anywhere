@@ -22,7 +22,14 @@ if [[ "$agent" == codex ]]; then
 else
 	export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 	mkdir -p "$CLAUDE_CONFIG_DIR"
-	if [[ -r /run/secrets/agent_api_key ]]; then
+	# Remote Control requires a claude.ai account token and refuses to start when
+	# ANTHROPIC_API_KEY is set, so keep the key away from those invocations.
+	claude_wants_account_auth=false
+	case "${1:-}" in
+	remote-control | --remote-control | --rc) claude_wants_account_auth=true ;;
+	auth) claude_wants_account_auth=true ;;
+	esac
+	if [[ -r /run/secrets/agent_api_key && "$claude_wants_account_auth" == false ]]; then
 		export ANTHROPIC_API_KEY
 		ANTHROPIC_API_KEY="$(cat /run/secrets/agent_api_key)"
 	fi
