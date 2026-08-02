@@ -3,6 +3,7 @@ FROM lscr.io/linuxserver/webtop:debian-xfce
 ARG NODE_MAJOR=24
 ARG CODEX_VERSION=latest
 ARG CLAUDE_CODE_VERSION=latest
+ARG OPENCODE_VERSION=latest
 
 USER root
 
@@ -25,7 +26,9 @@ RUN apt-get update \
 USER 1000
 RUN HOME=/agent-home CODEX_HOME=/agent-home/.codex CODEX_INSTALL_DIR=/agent-home/.local/bin CODEX_NON_INTERACTIVE=true \
 		sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh -s -- --release "$1"' _ "$CODEX_VERSION" \
-	&& HOME=/agent-home sh -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$1"' _ "$CLAUDE_CODE_VERSION"
+	&& HOME=/agent-home sh -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$1"' _ "$CLAUDE_CODE_VERSION" \
+	&& HOME=/agent-home OPENCODE_INSTALL_DIR=/agent-home/.local/bin \
+		sh -c 'curl -fsSL https://opencode.ai/install | bash -s -- --version "$1"' _ "$OPENCODE_VERSION"
 
 USER root
 RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -33,4 +36,5 @@ RUN rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 COPY scripts/agent-cli-launcher /usr/local/libexec/agent-cli-launcher
 RUN chmod 0755 /usr/local/libexec/agent-cli-launcher \
 	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/codex \
-	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/claude
+	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/claude \
+	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/opencode
