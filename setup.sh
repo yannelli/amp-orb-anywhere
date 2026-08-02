@@ -7,6 +7,11 @@ CONFIG_DIR="${AMP_RUNNER_CONFIG_DIR:-/etc/amp-runner}"
 STATE_DIR="$CONFIG_DIR/instances"
 SECRET_DIR="$CONFIG_DIR/secrets"
 SHARED_AUTH_DIR="$CONFIG_DIR/shared"
+PANEL_USER="${AMP_RUNNER_PANEL_USER:-amp-panel}"
+PANEL_PORT="${AMP_RUNNER_PANEL_PORT:-7900}"
+PANEL_SERVICE='amp-runner-panel'
+PANEL_SUDOERS='/etc/sudoers.d/amp-runner-panel'
+
 DATA_DIR="${AMP_RUNNER_DATA_DIR:-/srv/amp-runners}"
 IMAGE="${AMP_RUNNER_IMAGE:-amp-runner:ubuntu24.04}"
 DESKTOP_IMAGE="${AMP_RUNNER_DESKTOP_IMAGE:-amp-runner-desktop:debian-xfce}"
@@ -323,6 +328,16 @@ install_tool_files() {
 		install -m 0644 "$source/Dockerfile.desktop" "$INSTALL_DIR/Dockerfile.desktop"
 		install -d -m 0755 "$INSTALL_DIR/scripts"
 		install -m 0755 "$source"/scripts/*.sh "$source/scripts/agent-cli-launcher" "$INSTALL_DIR/scripts/"
+		# Without this the control panel would be dropped on every update and self-update.
+		if [[ -d "$source/panel" ]]; then
+			install -d -m 0755 "$INSTALL_DIR/panel"
+			install -m 0644 "$source/panel/package.json" "$source/panel/package-lock.json" "$source/panel/vite.config.js" \
+				"$source/panel/postcss.config.js" "$source/panel/index.html" "$INSTALL_DIR/panel/"
+			install -m 0755 "$source/panel/server.mjs" "$INSTALL_DIR/panel/server.mjs"
+			rm -rf "$INSTALL_DIR/panel/src"
+			cp -R "$source/panel/src" "$INSTALL_DIR/panel/src"
+			chmod -R u=rwX,go=rX "$INSTALL_DIR/panel/src"
+		fi
 	else
 		chmod 0755 "$INSTALL_DIR/setup.sh" "$INSTALL_DIR"/scripts/*.sh "$INSTALL_DIR/scripts/agent-cli-launcher"
 	fi
@@ -731,6 +746,141 @@ restore_desktop_access() {
 	systemctl restart "$(desktop_service_name "$id").service" || return 1
 	wait_for_desktop "$id" "$port" "$username" "$password" || return 1
 	if [[ "$access" == tailscale ]]; then enable_tailscale_desktop_route "$id" || return 1; fi
+}
+
+panel_password_path() {
+	printf '%s/panel-password' "$SECRET_DIR"
+}
+
+panel_url() {
+	printf 'http://127.0.0.1:%s/' "$PANEL_PORT"
+}
+
+ensure_panel_user() {
+	if ! id -u "$PANEL_USER" >/dev/null 2>&1; then
+		useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$PANEL_USER"
+	fi
+}
+
+# The panel drives systemd and nothing else. It deliberately cannot run setup.sh,
+# which also owns remove and uninstall, and it is kept out of the docker group
+# because that is equivalent to host root.
+write_panel_sudoers() {
+	local tmp
+	tmp="$(mktemp)"
+	cat > "$tmp" <<EOF
+$PANEL_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start amp-runner-*.service, /usr/bin/systemctl stop amp-runner-*.service, /usr/bin/systemctl restart amp-runner-*.service
+EOF
+	chmod 0440 "$tmp"
+	if ! visudo -c -q -f "$tmp"; then
+		rm -f "$tmp"
+		die 'Generated sudoers policy for the control panel is invalid.'
+	fi
+	install -m 0440 -o root -g root "$tmp" "$PANEL_SUDOERS"
+	rm -f "$tmp"
+}
+
+build_panel() {
+	local source="$INSTALL_DIR/panel"
+	[[ -f "$source/package.json" ]] || die 'Control panel sources are missing. Re-run bootstrap.'
+	command -v npm >/dev/null 2>&1 || die 'npm is required to build the control panel. Re-run bootstrap.'
+	say 'Building the control panel. This runs npm and can take a few minutes.'
+	if [[ -f "$source/package-lock.json" ]]; then
+		(cd "$source" && npm ci --no-audit --no-fund --loglevel=error && npm run build)
+	else
+		(cd "$source" && npm install --no-audit --no-fund --loglevel=error && npm run build)
+	fi
+	[[ -f "$source/dist/index.html" ]] || die 'The control panel build produced no output.'
+	chmod -R u=rwX,go=rX "$source/dist"
+}
+
+write_panel_unit() {
+	cat > "/etc/systemd/system/$PANEL_SERVICE.service" <<EOF
+[Unit]
+Description=Amp Orb Anywhere control panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$PANEL_USER
+Environment=AMP_PANEL_PORT=$PANEL_PORT
+Environment=AMP_PANEL_DIST=$INSTALL_DIR/panel/dist
+Environment=AMP_PANEL_PASSWORD_FILE=$(panel_password_path)
+Environment=AMP_RUNNER_STATE_DIR=$STATE_DIR
+Environment=AMP_PANEL_VERSION=$VERSION
+Environment=AMP_PANEL_HOSTNAME=$(hostname -s)
+ExecStart=$(command -v node) $INSTALL_DIR/panel/server.mjs
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload
+}
+
+enable_panel() {
+	require_root panel
+	ensure_layout
+	desktop_port_available "$PANEL_PORT" || die "Port $PANEL_PORT is already reserved or in use. Set AMP_RUNNER_PANEL_PORT and retry."
+	ensure_panel_user
+	if [[ ! -s "$(panel_password_path)" ]]; then
+		write_desktop_secret "$(panel_password_path)" "$(openssl rand -base64 18 | tr -d '\n/+=' | cut -c1-24)"
+	fi
+	chown "$PANEL_USER" "$(panel_password_path)"
+	write_panel_sudoers
+	build_panel
+	write_panel_unit
+	systemctl enable --now "$PANEL_SERVICE.service"
+	say
+	say 'Control panel enabled.'
+	panel_details
+}
+
+disable_panel() {
+	require_root panel
+	systemctl disable --now "$PANEL_SERVICE.service" >/dev/null 2>&1 || true
+	rm -f "/etc/systemd/system/$PANEL_SERVICE.service" "$PANEL_SUDOERS"
+	systemctl daemon-reload
+	say 'Control panel disabled. Its password file and build output were retained.'
+}
+
+panel_details() {
+	require_root panel
+	[[ -s "$(panel_password_path)" ]] || die 'The control panel is not enabled.'
+	say "URL:      $(panel_url) on this host"
+	say "Tunnel:   ssh -N -L $PANEL_PORT:127.0.0.1:$PANEL_PORT $(admin_user)@THIS_HOST"
+	say 'Username: any value'
+	say "Password: $(cat "$(panel_password_path)")"
+	say 'Publish it on a tailnet with:'
+	say "  sudo tailscale serve --bg --https=443 --set-path=/panel http://127.0.0.1:$PANEL_PORT"
+}
+
+panel_command() {
+	local action="${1:-status}"
+	case "$action" in
+	enable) enable_panel ;;
+	disable) disable_panel ;;
+	credentials) panel_details ;;
+	restart)
+		require_root panel
+		systemctl restart "$PANEL_SERVICE.service"
+		say 'Control panel restarted.'
+		;;
+	status)
+		require_root panel
+		printf 'Service: %s\n' "$(systemctl is-active "$PANEL_SERVICE.service" 2>/dev/null || true)"
+		printf 'URL: %s\n' "$(panel_url)"
+		;;
+	*) die 'panel expects enable, disable, status, credentials, or restart.' ;;
+	esac
 }
 
 openchamber_details() {
@@ -2748,6 +2898,7 @@ Usage:
   sudo ./setup.sh desktop disable|status|credentials RUNNER_ID
   sudo ./setup.sh desktop access RUNNER_ID tailscale|ssh
   sudo ./setup.sh openchamber RUNNER_ID
+  sudo ./setup.sh panel enable|disable|status|credentials|restart
   sudo ./setup.sh desktop rotate-password RUNNER_ID [--password-file PATH]
   sudo ./setup.sh desktop start|stop|restart|logs RUNNER_ID
   sudo ./setup.sh desktop-update [RUNNER_ID|--all]
@@ -3051,6 +3202,7 @@ main() {
 		;;
 	desktop) desktop_command "$@" ;;
 	openchamber) openchamber_details "$@" ;;
+	panel) panel_command "$@" ;;
 	desktop-update) update_desktops "$@" ;;
 	update) update_instances "$@" ;;
 	self-update) self_update "$@" ;;

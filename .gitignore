@@ -1,2 +1,4 @@
 .design-ref/
 .DS_Store
+panel/node_modules/
+panel/dist/

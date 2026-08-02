@@ -20,3 +20,22 @@ jobs:
         run: ./tests/test.sh
       - name: Run ShellCheck
         run: shellcheck setup.sh scripts/*.sh tests/test.sh
+
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+      - name: Install panel dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: panel
+      - name: Build panel
+        run: npm run build
+        working-directory: panel
+      - name: Check the panel server parses
+        run: node --check server.mjs
+        working-directory: panel
