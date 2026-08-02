@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=1.1.1 # x-release-please-version
+VERSION=1.1.2 # x-release-please-version
 INSTALL_DIR="${AMP_RUNNER_INSTALL_DIR:-/opt/amp-runner}"
 CONFIG_DIR="${AMP_RUNNER_CONFIG_DIR:-/etc/amp-runner}"
 STATE_DIR="$CONFIG_DIR/instances"

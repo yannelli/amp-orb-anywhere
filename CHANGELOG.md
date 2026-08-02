@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/yannelli/amp-orb-anywhere/compare/v1.1.1...v1.1.2) (2026-08-02)
+
+
+### Documentation
+
+* improve setup and update guide ([a7a38af](https://github.com/yannelli/amp-orb-anywhere/commit/a7a38afa4a74b29e5c774697f67ac6ed5d9a41ec))
+
 ## [1.1.1](https://github.com/yannelli/amp-orb-anywhere/compare/v1.1.0...v1.1.1) (2026-08-01)
 
 
