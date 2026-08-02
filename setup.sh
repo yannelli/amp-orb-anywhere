@@ -168,8 +168,35 @@ agent_provider() {
 	jq -r '.agent // "amp"' "$(state_file "$1")"
 }
 
+# Every supported workspace provider. Registering one means adding it here and
+# giving it an arm in the provider_* helpers below.
+AGENT_PROVIDERS=(amp codex claude opencode)
+
+validate_provider() {
+	local candidate="$1" provider
+	for provider in "${AGENT_PROVIDERS[@]}"; do
+		[[ "$provider" != "$candidate" ]] || return 0
+	done
+	return 1
+}
+
+provider_list_text() {
+	local IFS='|'
+	printf '%s' "${AGENT_PROVIDERS[*]}"
+}
+
+# Providers shipping a documented account-login remote control relay. OpenCode
+# serves a local HTTP API instead, which the OpenChamber pairing exposes.
+provider_supports_native_remote() {
+	case "$1" in codex | claude) return 0 ;; *) return 1 ;; esac
+}
+
 native_remote_enabled() {
 	jq -r '.nativeRemote // false' "$(state_file "$1")"
+}
+
+openchamber_enabled() {
+	jq -r '.openchamber.enabled // false' "$(state_file "$1")"
 }
 
 # Legacy state files predate shared auth, so they keep their isolated per-workspace
@@ -184,6 +211,7 @@ ensure_add_resources_available() {
 		"$(token_path "$id")" \
 		"$(desktop_username_path "$id")" \
 		"$(desktop_password_path "$id")" \
+		"$(openchamber_password_path "$id")" \
 		"/etc/systemd/system/$(service_name "$id").service" \
 		"/etc/systemd/system/$(desktop_service_name "$id").service"; do
 		[[ ! -e "$path" ]] || die "Runner ID $id has orphaned resources at $path. Remove or rename them before retrying."
@@ -210,7 +238,7 @@ rollback_add_instance() {
 	docker rm --force "$(desktop_service_name "$id")" "amp-runner-$id" >/dev/null 2>&1 || true
 	docker network rm "amp-runner-$id" >/dev/null 2>&1 || true
 	rm -f "/etc/systemd/system/$(desktop_service_name "$id").service" "/etc/systemd/system/$(service_name "$id").service"
-	rm -f "$(desktop_username_path "$id")" "$(desktop_password_path "$id")"
+	rm -f "$(desktop_username_path "$id")" "$(desktop_password_path "$id")" "$(openchamber_password_path "$id")"
 	if [[ "$ADD_TRANSACTION_SECRET_CREATED" == true ]]; then rm -f "$(token_path "$id")"; fi
 	if [[ "$ADD_TRANSACTION_VOLUME_CREATED" == true ]]; then
 		docker volume rm "amp-runner-${id}-home" >/dev/null 2>&1 || true
@@ -417,22 +445,26 @@ install_tailscale() {
 }
 
 build_image() {
-	local codex_version claude_version
+	local codex_version claude_version opencode_version
 	codex_version="$(npm view @openai/codex version)"
 	claude_version="$(npm view @anthropic-ai/claude-code version)"
+	opencode_version="$(npm view opencode-ai version)"
 	docker build --pull \
 		--build-arg "CODEX_VERSION=$codex_version" \
 		--build-arg "CLAUDE_CODE_VERSION=$claude_version" \
+		--build-arg "OPENCODE_VERSION=$opencode_version" \
 		--tag "$IMAGE" "$INSTALL_DIR"
 }
 
 build_desktop_image() {
-	local codex_version claude_version
+	local codex_version claude_version opencode_version
 	codex_version="$(npm view @openai/codex version)"
 	claude_version="$(npm view @anthropic-ai/claude-code version)"
+	opencode_version="$(npm view opencode-ai version)"
 	docker build --pull \
 		--build-arg "CODEX_VERSION=$codex_version" \
 		--build-arg "CLAUDE_CODE_VERSION=$claude_version" \
+		--build-arg "OPENCODE_VERSION=$opencode_version" \
 		--file "$INSTALL_DIR/Dockerfile.desktop" --tag "$DESKTOP_IMAGE" "$INSTALL_DIR"
 }
 
@@ -454,8 +486,10 @@ desktop_port_available() {
 	[[ "$port" =~ ^[0-9]+$ && "$port" -ge 1024 && "$port" -le 65535 ]] || return 1
 	for file in "$STATE_DIR"/*.json; do
 		[[ -e "$file" ]] || continue
-		reserved="$(jq -r '.desktop.port // empty' "$file")"
-		[[ "$reserved" != "$port" ]] || return 1
+		# Both loopback services draw from the same host port space.
+		for reserved in "$(jq -r '.desktop.port // empty' "$file")" "$(jq -r '.openchamber.port // empty' "$file")"; do
+			[[ "$reserved" != "$port" ]] || return 1
+		done
 	done
 	! ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
 }
@@ -469,6 +503,21 @@ next_desktop_port() {
 		fi
 	done
 	die 'No free desktop port is available between 6080 and 6279.'
+}
+
+openchamber_password_path() {
+	printf '%s/%s.openchamber-password' "$SECRET_DIR" "$1"
+}
+
+next_openchamber_port() {
+	local port
+	for ((port = 7080; port <= 7279; port++)); do
+		if desktop_port_available "$port"; then
+			printf '%s\n' "$port"
+			return
+		fi
+	done
+	die 'No free OpenChamber port is available between 7080 and 7279.'
 }
 
 write_desktop_secret() {
@@ -682,6 +731,20 @@ restore_desktop_access() {
 	systemctl restart "$(desktop_service_name "$id").service" || return 1
 	wait_for_desktop "$id" "$port" "$username" "$password" || return 1
 	if [[ "$access" == tailscale ]]; then enable_tailscale_desktop_route "$id" || return 1; fi
+}
+
+openchamber_details() {
+	require_root openchamber
+	local id="${1:-}" port
+	[[ -n "$id" && -r "$(state_file "$id")" ]] || die 'openchamber requires a known RUNNER_ID.'
+	[[ "$(openchamber_enabled "$id")" == true ]] || die "OpenChamber is not enabled for $id."
+	port="$(jq -r '.openchamber.port // 0' "$(state_file "$id")")"
+	say "Workspace: $id"
+	say "URL:      https://127.0.0.1:$port/ after forwarding, or http://127.0.0.1:$port/ on this host"
+	say "Tunnel:   ssh -N -L $port:127.0.0.1:$port $(admin_user)@THIS_HOST"
+	say "Password: $(cat "$(openchamber_password_path "$id")")"
+	say 'Publish it on a tailnet with:'
+	say "  sudo tailscale serve --bg --https=443 --set-path=/chamber/$id http://127.0.0.1:$port"
 }
 
 cleanup_desktop_resources() {
@@ -1006,6 +1069,7 @@ provider_config_target() {
 	case "$1" in
 	codex) printf '/agent-home/.codex' ;;
 	claude) printf '/agent-home/.claude' ;;
+	opencode) printf '/agent-home/.local/share/opencode' ;;
 	*) return 1 ;;
 	esac
 }
@@ -1153,6 +1217,7 @@ authenticate_agent_container() {
 	fi
 	case "$provider" in
 	codex) container_agent_interactive "$id" "$workspace" "$volume" "$shared" codex login --device-auth ;;
+	opencode) container_agent_interactive "$id" "$workspace" "$volume" "$shared" opencode auth login ;;
 	claude)
 		container_agent_interactive "$id" "$workspace" "$volume" "$shared" claude auth login
 		say 'Claude will open once so you can accept workspace trust. Exit Claude after accepting.'
@@ -1364,15 +1429,16 @@ prepare_devcontainer_amp() {
 }
 
 write_state() {
-	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}" agent="${11:-amp}" native_remote="${12:-false}" shared_auth="${13:-false}"
+	local id="$1" mode="$2" user="$3" workspace="$4" project_ref="$5" remote="$6" auth="$7" remote_terminal="$8" docker_access="$9" base_repo="${10:-}" agent="${11:-amp}" native_remote="${12:-false}" shared_auth="${13:-false}" openchamber="${14:-false}" openchamber_port="${15:-0}"
 	jq -n \
 		--arg id "$id" --arg mode "$mode" --arg user "$user" --arg workspace "$workspace" \
 		--arg project "$project_ref" --arg repositoryURL "$remote" --arg auth "$auth" --arg agent "$agent" \
 		--arg service "$(service_name "$id")" --arg dockerAccess "$docker_access" \
 		--arg baseRepository "$base_repo" --argjson remoteTerminal "$remote_terminal" --argjson nativeRemote "$native_remote" \
 		--argjson sharedAuth "$shared_auth" \
+		--argjson openchamber "$openchamber" --argjson openchamberPort "$openchamber_port" \
 		--arg createdAt "$(date --iso-8601=seconds)" \
-		'{id:$id,agent:$agent,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,nativeRemote:$nativeRemote,sharedAuth:$sharedAuth,desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
+		'{id:$id,agent:$agent,mode:$mode,user:$user,workspace:$workspace,project:$project,repositoryURL:$repositoryURL,auth:$auth,service:$service,dockerAccess:$dockerAccess,baseRepository:$baseRepository,remoteTerminal:$remoteTerminal,nativeRemote:$nativeRemote,sharedAuth:$sharedAuth,openchamber:{enabled:$openchamber,port:$openchamberPort},desktop:{enabled:false,access:"",port:0,username:""},createdAt:$createdAt}' \
 		> "$(state_file "$id")"
 	chmod 0644 "$(state_file "$id")"
 }
@@ -1422,12 +1488,14 @@ add_instance() {
 	[[ -f "$CONFIG_DIR/.bootstrapped" ]] || die 'Run sudo amp-runner-setup bootstrap first.'
 
 	local agent='' mode='' id='' auth='' token='' token_file='' requested_project='' requested_repository='' workspace='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
-	local desktop='' desktop_access='' shared_auth=''
+	local desktop='' desktop_access='' shared_auth='' openchamber='' openchamber_port=0
 	while (($#)); do
 		case "$1" in
 		--agent) agent="$2"; shift ;;
 		--shared-auth) shared_auth=true ;;
 		--isolated-auth) shared_auth=false ;;
+		--openchamber) openchamber=true ;;
+		--no-openchamber) openchamber=false ;;
 		--mode) mode="$2"; shift ;;
 		--id) id="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
@@ -1451,8 +1519,9 @@ add_instance() {
 	done
 
 	ui_title 'Add agent workspace'
-	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' 'amp' 'codex' 'claude')"
-	case "$agent" in amp | codex | claude) ;; *) die '--agent must be amp, codex, or claude.' ;; esac
+	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' "${AGENT_PROVIDERS[@]}")"
+	validate_provider "$agent" || die "--agent must be one of $(provider_list_text)."
+
 	if [[ "$agent" == amp ]]; then
 		[[ -n "$mode" ]] || mode="$(ui_choose 'Instance type' 'host' 'docker' 'worktree' 'devcontainer')"
 	else
@@ -1471,6 +1540,8 @@ add_instance() {
 
 	[[ -n "$auth" ]] || auth="$(ui_choose "$agent authentication" 'interactive' 'token')"
 	case "$auth" in interactive | token) ;; *) die "Invalid authentication method: $auth" ;; esac
+	# OpenCode brokers many model providers, so there is no single API key to mount.
+	[[ "$agent" != opencode || "$auth" != token ]] || die 'OpenCode workspaces authenticate with opencode auth login; --auth token is not supported.'
 	if [[ "$auth" == token ]]; then
 		if [[ -n "$token_file" ]]; then
 			[[ -r "$token_file" ]] || die "Cannot read token file: $token_file"
@@ -1553,7 +1624,7 @@ add_instance() {
 	elif [[ -z "$remote_terminal" ]]; then
 		if have_tty && ui_confirm 'Enable web terminal access for remotely controlled threads?' no; then remote_terminal=true; else remote_terminal=false; fi
 	fi
-	if [[ "$agent" == amp ]]; then
+	if ! provider_supports_native_remote "$agent"; then
 		[[ "$native_remote" != true ]] || die '--native-remote is for Codex and Claude workspaces.'
 		native_remote=false
 	elif [[ "$auth" == token ]]; then
@@ -1587,6 +1658,14 @@ add_instance() {
 		shared_auth=false
 	elif [[ -z "$shared_auth" ]]; then
 		shared_auth=true
+	fi
+	# OpenChamber is a browser front end for a local opencode server, so it only
+	# means anything for an OpenCode workspace.
+	if [[ "$agent" != opencode ]]; then
+		[[ "$openchamber" != true ]] || die '--openchamber is for OpenCode workspaces.'
+		openchamber=false
+	elif [[ -z "$openchamber" ]]; then
+		if have_tty && ui_confirm 'Pair this OpenCode workspace with the OpenChamber browser interface?' no; then openchamber=true; else openchamber=false; fi
 	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
 	if [[ "$agent" != amp && "$docker_access" != none ]]; then
@@ -1622,7 +1701,11 @@ add_instance() {
 		;;
 	esac
 
-	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo" "$agent" "$native_remote" "$shared_auth"
+	if [[ "$openchamber" == true ]]; then
+		openchamber_port="$(next_openchamber_port)"
+		write_desktop_secret "$(openchamber_password_path "$id")" "$(openssl rand -base64 18 | tr -d '\n/+=' | cut -c1-24)"
+	fi
+	write_state "$id" "$mode" "$user" "$workspace" "$project_ref" "$remote" "$auth" "$remote_terminal" "$docker_access" "$base_repo" "$agent" "$native_remote" "$shared_auth" "$openchamber" "$openchamber_port"
 	write_unit "$id" "$mode" "$user" "$auth" "$agent"
 	if [[ "$desktop" == true ]]; then enable_desktop "$id" --access "$desktop_access"; fi
 	ADD_TRANSACTION_ACTIVE=false
@@ -1668,13 +1751,15 @@ provision_instances() {
 	PROVISION_TEMP_TOKEN_FILE=''
 
 	local agent='' mode='' auth='' token_file='' generated_token_file='' token='' clone_repo='' remote_terminal='' native_remote='' docker_access='none'
-	local desktop='' desktop_access='' shared_auth=''
+	local desktop='' desktop_access='' shared_auth='' openchamber=''
 	local -a requested_specs=()
 	while (($#)); do
 		case "$1" in
 		--agent) agent="$2"; shift ;;
 		--shared-auth) shared_auth=true ;;
 		--isolated-auth) shared_auth=false ;;
+		--openchamber) openchamber=true ;;
+		--no-openchamber) openchamber=false ;;
 		--mode) mode="$2"; shift ;;
 		--auth) auth="$2"; shift ;;
 		--token-file) token_file="$2"; shift ;;
@@ -1695,8 +1780,9 @@ provision_instances() {
 	done
 
 	ui_title 'Provision agent fleet'
-	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' 'amp' 'codex' 'claude')"
-	case "$agent" in amp | codex | claude) ;; *) die '--agent must be amp, codex, or claude.' ;; esac
+	[[ -n "$agent" ]] || agent="$(ui_choose 'Agent' "${AGENT_PROVIDERS[@]}")"
+	validate_provider "$agent" || die "--agent must be one of $(provider_list_text)."
+
 	if [[ "$agent" == amp ]]; then
 		[[ -n "$mode" ]] || mode="$(ui_choose 'Runtime isolation' 'docker' 'worktree' 'devcontainer' 'host')"
 	else
@@ -1706,6 +1792,8 @@ provision_instances() {
 	case "$mode" in host | docker | worktree | devcontainer) ;; *) die "Invalid mode: $mode" ;; esac
 	[[ -n "$auth" ]] || auth="$(ui_choose "$agent authentication" 'token' 'interactive')"
 	case "$auth" in interactive | token) ;; *) die "Invalid authentication method: $auth" ;; esac
+	# OpenCode brokers many model providers, so there is no single API key to mount.
+	[[ "$agent" != opencode || "$auth" != token ]] || die 'OpenCode workspaces authenticate with opencode auth login; --auth token is not supported.'
 	if [[ "$auth" == token ]]; then
 		if [[ -n "$token_file" ]]; then
 			[[ -r "$token_file" ]] || die "Cannot read token file: $token_file"
@@ -1731,7 +1819,7 @@ provision_instances() {
 	[[ -n "$remote_terminal" ]] || {
 		if have_tty && ui_confirm 'Enable web terminal access for these runners?' no; then remote_terminal=true; else remote_terminal=false; fi
 	}
-	if [[ "$agent" == amp ]]; then
+	if ! provider_supports_native_remote "$agent"; then
 		[[ "$native_remote" != true ]] || die '--native-remote is for Codex and Claude workspaces.'
 		native_remote=false
 	elif [[ "$auth" == token ]]; then
@@ -1764,6 +1852,14 @@ provision_instances() {
 		shared_auth=false
 	elif [[ -z "$shared_auth" ]]; then
 		shared_auth=true
+	fi
+	# OpenChamber is a browser front end for a local opencode server, so it only
+	# means anything for an OpenCode workspace.
+	if [[ "$agent" != opencode ]]; then
+		[[ "$openchamber" != true ]] || die '--openchamber is for OpenCode workspaces.'
+		openchamber=false
+	elif [[ -z "$openchamber" ]]; then
+		if have_tty && ui_confirm 'Pair this OpenCode workspace with the OpenChamber browser interface?' no; then openchamber=true; else openchamber=false; fi
 	fi
 	case "$docker_access" in none | socket) ;; *) die '--docker-access must be none or socket.' ;; esac
 	if [[ "$agent" != amp && "$docker_access" != none ]]; then
@@ -1861,6 +1957,7 @@ provision_instances() {
 			if [[ "$remote_terminal" == true ]]; then add_args+=(--remote-terminal); else add_args+=(--no-remote-terminal); fi
 			if [[ "$native_remote" == true ]]; then add_args+=(--native-remote); else add_args+=(--no-native-remote); fi
 			if [[ "$shared_auth" == true ]]; then add_args+=(--shared-auth); else add_args+=(--isolated-auth); fi
+			if [[ "$openchamber" == true ]]; then add_args+=(--openchamber); else add_args+=(--no-openchamber); fi
 			if [[ "$desktop" == true ]]; then add_args+=(--desktop --desktop-access "$desktop_access"); else add_args+=(--no-desktop); fi
 			add_instance "${add_args[@]}"
 		done
@@ -1970,6 +2067,32 @@ run_agent_container() {
 				exec claude remote-control --name "$AGENT_WORKSPACE_ID" --spawn same-dir'
 			;;
 		esac
+	fi
+	if [[ "$agent" == opencode && "$(openchamber_enabled "$id")" == true ]]; then
+		local chamber_port
+		chamber_port="$(jq -r '.openchamber.port // 0' "$(state_file "$id")")"
+		[[ "$chamber_port" != 0 ]] || die "Runner $id has no OpenChamber port."
+		# Published to host loopback only. The in-container bind must be broad for
+		# Docker to forward the published port.
+		CONTAINER_ARGS+=(--env "AGENT_WORKSPACE_ID=$id"
+			--publish "127.0.0.1:$chamber_port:3000"
+			--mount "type=bind,source=$(openchamber_password_path "$id"),target=/run/secrets/openchamber_password,readonly")
+		exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c '
+			opencode serve --hostname 127.0.0.1 --port 4096 &
+			opencode_pid=$!
+			trap '\''kill "$opencode_pid" 2>/dev/null || true; exit 0'\'' TERM INT
+			waited=0
+			while [ "$waited" -lt 60 ]; do
+				curl -fsS -o /dev/null "http://127.0.0.1:4096/" 2>/dev/null && break
+				kill -0 "$opencode_pid" 2>/dev/null || exit 1
+				waited=$((waited + 1))
+				sleep 1
+			done
+			# Attach to the server started above instead of letting OpenChamber spawn
+			# its own, so both halves share one workspace and one login.
+			OPENCODE_HOST=http://127.0.0.1 OPENCODE_PORT=4096 OPENCODE_SKIP_START=true \
+				OPENCHAMBER_UI_PASSWORD="$(cat /run/secrets/openchamber_password)" \
+				exec openchamber serve --host 0.0.0.0 --port 3000'
 	fi
 	exec docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c 'trap "exit 0" TERM INT; while :; do sleep 3600; done'
 }
@@ -2150,6 +2273,7 @@ authenticate_agent_instance() {
 	if [[ -t 0 && -t 1 ]]; then terminal+=(--tty); fi
 	case "$agent" in
 		codex) docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" codex login --device-auth ;;
+		opencode) docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" opencode auth login ;;
 		claude)
 			docker exec "${terminal[@]}" --workdir /workspace "amp-runner-$id" claude auth login
 			say 'Claude will open once so you can accept workspace trust. Exit Claude after accepting.'
@@ -2334,6 +2458,10 @@ update_agent_cli_volume() {
 	claude)
 		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c \
 			'curl -fsSL https://claude.ai/install.sh | HOME=/agent-home bash'
+		;;
+	opencode)
+		docker run "${CONTAINER_ARGS[@]}" "$IMAGE" sh -c \
+			'curl -fsSL https://opencode.ai/install | HOME=/agent-home OPENCODE_INSTALL_DIR=/agent-home/.local/bin bash'
 		;;
 	esac
 	new_version="$(docker run "${CONTAINER_ARGS[@]}" "$IMAGE" "$agent" --version)"
@@ -2542,7 +2670,7 @@ remove_instance() {
 	fi
 	systemctl disable --now "$(service_name "$id").service" >/dev/null 2>&1 || true
 	stop_instance_runtime "$id"
-	rm -f "/etc/systemd/system/$(service_name "$id").service" "$(token_path "$id")"
+	rm -f "/etc/systemd/system/$(service_name "$id").service" "$(token_path "$id")" "$(openchamber_password_path "$id")"
 	if [[ "$purge" == --purge ]]; then
 		if [[ "$mode" == worktree && -n "$base" && -d "$base/.git" ]]; then
 			as_user "$(jq -r '.user' "$file")" git -C "$base" worktree remove --force "$workspace"
@@ -2619,6 +2747,7 @@ Usage:
   sudo ./setup.sh desktop enable RUNNER_ID [--access tailscale|ssh]
   sudo ./setup.sh desktop disable|status|credentials RUNNER_ID
   sudo ./setup.sh desktop access RUNNER_ID tailscale|ssh
+  sudo ./setup.sh openchamber RUNNER_ID
   sudo ./setup.sh desktop rotate-password RUNNER_ID [--password-file PATH]
   sudo ./setup.sh desktop start|stop|restart|logs RUNNER_ID
   sudo ./setup.sh desktop-update [RUNNER_ID|--all]
@@ -2631,7 +2760,7 @@ Usage:
   sudo ./setup.sh uninstall [--purge]
 
 Add options:
-  --agent amp|codex|claude
+  --agent amp|codex|claude|opencode
   --mode host|docker|worktree|devcontainer
   --id DNS_LABEL
   --auth interactive|token
@@ -2642,6 +2771,7 @@ Add options:
   --remote-terminal | --no-remote-terminal
   --native-remote | --no-native-remote
   --shared-auth | --isolated-auth
+  --openchamber | --no-openchamber
   --desktop | --no-desktop
   --desktop-access tailscale|ssh
   --docker-access none|socket
@@ -2920,6 +3050,7 @@ main() {
 		case "$2" in --remote-terminal) set_remote_terminal "$1" true ;; --no-remote-terminal) set_remote_terminal "$1" false ;; *) die "Unknown configure option: $2" ;; esac
 		;;
 	desktop) desktop_command "$@" ;;
+	openchamber) openchamber_details "$@" ;;
 	desktop-update) update_desktops "$@" ;;
 	update) update_instances "$@" ;;
 	self-update) self_update "$@" ;;

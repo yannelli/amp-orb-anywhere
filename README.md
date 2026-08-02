@@ -266,17 +266,18 @@ Amp and Git-host authentication are separate. The wizard can run `gh auth login`
 
 For GitHub-backed Docker workspaces, setup transfers the authenticated host `gh` credential over stdin and configures Git's `gh` credential helper inside that workspace. It does not put the credential in the state file, Docker environment literals, process arguments, or a clone URL. Use a dedicated least-privilege GitHub identity if workspaces should not inherit your full account access.
 
-### Codex and Claude Code
+### Codex, Claude Code, and OpenCode
 
 Authenticate a workspace with its provider account:
 
 ```bash
 # Codex runs: codex login --device-auth
 # Claude Code runs: claude auth login
+# OpenCode runs: opencode auth login
 sudo amp-runner-setup authenticate WORKSPACE_ID
 ```
 
-Codex uses `CODEX_HOME=/agent-home/.codex`. Claude Code uses `CLAUDE_CONFIG_DIR=/agent-home/.claude`. Settings, OAuth state, and session history survive image and container replacement.
+Codex uses `CODEX_HOME=/agent-home/.codex`. Claude Code uses `CLAUDE_CONFIG_DIR=/agent-home/.claude`. OpenCode keeps its credentials under `/agent-home/.local/share/opencode`. OpenCode brokers many model providers, so it has no single API key to mount; it does not accept `--auth token`. Settings, OAuth state, and session history survive image and container replacement.
 
 ### One login for a fleet
 
@@ -350,6 +351,30 @@ sudo amp-runner-setup remote pair CODEX_WORKSPACE_ID
 If pairing a headless container does not surface the workspace, use the route OpenAI documents instead: reach this host over Tailscale SSH and add it in the Codex app under Settings, Connections, Add SSH Host, then select the workspace directory. The app starts its own `codex app-server` over that SSH connection. Do not expose the app server on a public network; a tailnet is the recommended transport.
 
 Both provider relays use outbound TLS and open no inbound container port. Synchronized sessions remain subject to the provider's data policy.
+
+### OpenCode and OpenChamber
+
+OpenCode workspaces are provisioned like any other agent:
+
+```bash
+sudo amp-runner-setup add --agent opencode --repository acme/api
+sudo amp-runner-setup provision --agent opencode --repository acme/api=3
+```
+
+Pair one with the OpenChamber browser interface using `--openchamber`. OpenChamber is a front end for a local `opencode` server, so the workspace runs `opencode serve` on container loopback and starts OpenChamber against it with `OPENCODE_SKIP_START=true`. Both halves share one workspace and one login rather than OpenChamber spawning a second server.
+
+```bash
+sudo amp-runner-setup add --agent opencode --openchamber --repository acme/api
+sudo amp-runner-setup openchamber WORKSPACE_ID
+```
+
+The port is published to host loopback only, in the range 7080 to 7279, and is reserved against browser-desktop ports so the two never collide. A generated password protects the interface. Reach it over an SSH tunnel, or publish it on a tailnet yourself:
+
+```bash
+sudo tailscale serve --bg --https=443 --set-path=/chamber/WORKSPACE_ID http://127.0.0.1:PORT
+```
+
+OpenCode has no provider-hosted remote relay, so `--native-remote` does not apply to it. OpenChamber is the browser path instead.
 
 ### Browser desktop
 
@@ -565,6 +590,7 @@ The timer schedules work; the one-shot service performs it. A failed service rem
 | --- | --- | --- |
 | Independent Codex and Claude Code workspaces | Yes | Persistent Docker home and repository, interactive login or API key |
 | Claude Code Remote Control | Yes | Documented outbound-only headless relay with web and mobile sessions |
+| OpenCode workspaces with optional OpenChamber | Yes | Account login through `opencode auth login`; OpenChamber is a loopback browser interface, not a provider relay |
 | Codex Remote Control | Experimental | Uses shipped CLI daemon and pairing commands; OpenAI does not guarantee direct headless-container parity with its desktop remote workflow |
 | Amp remote thread creation | Yes | A client can target a live runner ID |
 | Amp remote terminal | Yes | Opt in per runner with `--remote-terminal` |

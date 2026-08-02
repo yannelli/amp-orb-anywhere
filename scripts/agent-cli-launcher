@@ -3,7 +3,7 @@ set -euo pipefail
 
 agent="$(basename "$0")"
 case "$agent" in
-	codex | claude) ;;
+	codex | claude | opencode) ;;
 	*) printf 'Unsupported agent CLI: %s\n' "$agent" >&2; exit 2 ;;
 esac
 
@@ -11,7 +11,13 @@ if [[ -d /agent-home ]]; then
 	export HOME=/agent-home
 fi
 
-if [[ "$agent" == codex ]]; then
+if [[ "$agent" == opencode ]]; then
+	# OpenCode reads credentials from its XDG data directory, which resolves under
+	# HOME. It is multi-provider, so it has no single API key to map here.
+	export OPENCODE_CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+	mkdir -p "$OPENCODE_CONFIG_DIR" "$HOME/.local/share/opencode"
+	real_cli="$HOME/.local/bin/opencode"
+elif [[ "$agent" == codex ]]; then
 	export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 	mkdir -p "$CODEX_HOME"
 	if [[ -r /run/secrets/agent_api_key ]]; then

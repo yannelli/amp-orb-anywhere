@@ -193,6 +193,59 @@ write_state shared-state docker tester /tmp/shared-work acme/api https://github.
 assert_equal 'true' "$(shared_auth_enabled shared-state)" 'shared auth state serialization'
 assert_equal 'false' "$(shared_auth_enabled local)" 'legacy state keeps isolated credentials'
 
+# Provider registration is a single list plus provider_* arms, not a duplicated
+# case statement in add, provision, the help text, and the launcher.
+if validate_provider opencode && validate_provider amp && ! validate_provider nope; then
+	pass 'provider registry validates known agents'
+else
+	fail 'provider registry validates known agents'
+fi
+assert_equal 'amp|codex|claude|opencode' "$(provider_list_text)" 'provider list text'
+if provider_supports_native_remote claude && provider_supports_native_remote codex && \
+	! provider_supports_native_remote opencode && ! provider_supports_native_remote amp; then
+	pass 'native Remote Control capability is provider driven'
+else
+	fail 'native Remote Control capability is provider driven'
+fi
+assert_equal '/agent-home/.local/share/opencode' "$(provider_config_target opencode)" 'OpenCode shared credential path'
+
+write_state opencode-test docker tester /tmp/oc-work acme/api https://github.com/acme/api interactive false none '' opencode false true true 7080
+assert_equal 'opencode' "$(agent_provider opencode-test)" 'OpenCode provider state serialization'
+assert_equal 'true' "$(openchamber_enabled opencode-test)" 'OpenChamber state serialization'
+assert_equal 'false' "$(openchamber_enabled local)" 'legacy state has no OpenChamber'
+
+# Both loopback services draw from the same host port space.
+printf '%s\n' '{"openchamber":{"enabled":true,"port":7081}}' > "$STATE_DIR/chamber-reserved.json"
+if ! desktop_port_available 7081 && desktop_port_available 7082; then
+	pass 'OpenChamber ports are reserved against desktop ports'
+else
+	fail 'OpenChamber ports are reserved against desktop ports'
+fi
+rm -f "$STATE_DIR/chamber-reserved.json"
+
+if grep -q 'OPENCODE_SKIP_START=true' "$ROOT/setup.sh" && \
+	grep -q -- '--publish "127.0.0.1:$chamber_port:3000"' "$ROOT/setup.sh" && \
+	grep -q 'OPENCHAMBER_UI_PASSWORD' "$ROOT/setup.sh"; then
+	pass 'OpenChamber attaches to the workspace opencode server on loopback'
+else
+	fail 'OpenChamber attaches to the workspace opencode server on loopback'
+fi
+
+if grep -q '| opencode)' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q 'OPENCODE_CONFIG_DIR' "$ROOT/scripts/agent-cli-launcher" && \
+	grep -q '\.local/bin/opencode' "$ROOT/scripts/agent-cli-launcher"; then
+	pass 'launcher maps OpenCode configuration'
+else
+	fail 'launcher maps OpenCode configuration'
+fi
+
+if grep -q 'opencode auth login' "$ROOT/setup.sh" && \
+	grep -q 'auth token is not supported' "$ROOT/setup.sh"; then
+	pass 'OpenCode uses account login rather than a single API key'
+else
+	fail 'OpenCode uses account login rather than a single API key'
+fi
+
 assert_equal '/desktop/local/' "$(desktop_subfolder local)" 'desktop reverse-proxy path'
 assert_equal 'false' "$(desktop_state_value local '.desktop.enabled' false)" 'legacy state desktop default'
 printf '%s\n' '{"desktop":{"enabled":true,"port":6080}}' > "$STATE_DIR/reserved.json"

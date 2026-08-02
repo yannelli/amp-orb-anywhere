@@ -5,6 +5,7 @@ ARG GO_VERSION=latest
 ARG RUST_TOOLCHAIN=stable
 ARG CODEX_VERSION=latest
 ARG CLAUDE_CODE_VERSION=latest
+ARG OPENCODE_VERSION=latest
 
 COPY scripts/install-packages.sh scripts/install-runtimes.sh /tmp/amp-runner/
 RUN /tmp/amp-runner/install-packages.sh container \
@@ -21,14 +22,18 @@ USER amp
 RUN HOME=/agent-home CODEX_HOME=/agent-home/.codex CODEX_INSTALL_DIR=/agent-home/.local/bin CODEX_NON_INTERACTIVE=true \
 		sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh -s -- --release "$1"' _ "$CODEX_VERSION" \
 	&& HOME=/agent-home sh -c 'curl -fsSL https://claude.ai/install.sh | bash -s "$1"' _ "$CLAUDE_CODE_VERSION" \
+	&& HOME=/agent-home OPENCODE_INSTALL_DIR=/agent-home/.local/bin \
+		sh -c 'curl -fsSL https://opencode.ai/install | bash -s -- --version "$1"' _ "$OPENCODE_VERSION" \
 	&& curl -fsSL https://ampcode.com/install.sh | bash
 
 USER root
 COPY scripts/agent-cli-launcher /usr/local/libexec/agent-cli-launcher
+RUN curl -fsSL https://raw.githubusercontent.com/openchamber/openchamber/main/scripts/install.sh | bash
 RUN chmod 0755 /usr/local/libexec/agent-cli-launcher \
 	&& chmod u+s /usr/bin/bwrap \
 	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/codex \
 	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/claude \
+	&& ln -s /usr/local/libexec/agent-cli-launcher /usr/local/bin/opencode \
 	&& ln -s /home/amp/.amp/bin/amp /usr/local/bin/amp
 COPY scripts/entrypoint.sh /usr/local/bin/amp-runner-entrypoint
 RUN chmod 0755 /usr/local/bin/amp-runner-entrypoint
