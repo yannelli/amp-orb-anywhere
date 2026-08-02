@@ -391,15 +391,28 @@ EOF
 
 install_tailscale() {
 	local codename
-	codename="$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '"')"
-	curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg
-	curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list
-	apt-get update -qq
-	DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale
-	if have_tty; then
-		tailscale up
+	# Bootstrap is also the repair path, so this runs on hosts that already have
+	# Tailscale. Reinstalling would rewrite the keyring and apt source every time,
+	# and a bare tailscale up can re-prompt a node that is already authenticated.
+	if command -v tailscale >/dev/null 2>&1; then
+		say 'Tailscale is already installed; skipping package installation.'
 	else
-		say 'Tailscale installed. Run sudo tailscale up from an SSH session to authenticate.'
+		codename="$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '"')"
+		curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+		curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list
+		apt-get update -qq
+		DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale
+	fi
+	if tailscale_online; then
+		say "Tailscale is already authenticated and online as $(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "this node"' | sed 's/\.$//')."
+		return 0
+	fi
+	if have_tty; then
+		# --ssh is what makes the documented "remove public SSH once Tailscale SSH
+		# works" step, and the Codex remote SSH-host route, actually possible.
+		tailscale up --ssh
+	else
+		say 'Tailscale installed. Run sudo tailscale up --ssh from an SSH session to authenticate.'
 	fi
 }
 
@@ -519,7 +532,7 @@ EOF
 }
 
 run_desktop() {
-	local id="$1" workspace mode user uid gid port access name provider key='' subfolder='/'
+	local id="$1" workspace mode user uid gid port name provider key='' subfolder='/'
 	local -a args
 	[[ -r "$(state_file "$id")" ]] || die "Unknown runner: $id"
 	desktop_enabled "$id" || die "Web workspace is disabled for runner $id."
@@ -535,9 +548,10 @@ run_desktop() {
 		gid="$(id -g "$user")"
 	fi
 	port="$(desktop_state_value "$id" '.desktop.port' '')"
-	access="$(desktop_state_value "$id" '.desktop.access' ssh)"
 	[[ -n "$port" ]] || die "Runner $id has no web workspace port."
-	[[ "$access" != tailscale ]] || subfolder="$(desktop_subfolder "$id")"
+	# SUBFOLDER stays '/' for both access modes. Tailscale Serve mounts this container
+	# at /desktop/ID and forwards the remainder, so telling the container's own web
+	# server to also expect that prefix left it serving its default page instead.
 	name="$(desktop_service_name "$id")"
 	docker rm --force "$name" >/dev/null 2>&1 || true
 	args=(--rm
@@ -556,6 +570,7 @@ run_desktop() {
 		--env "TITLE=$provider Workspace: $id"
 		--env "SUBFOLDER=$subfolder"
 		--env 'FILE_MANAGER_PATH=/workspace'
+		--env 'FM_HOME=/workspace'
 		--env 'FILE__CUSTOM_USER=/run/secrets/webtop_username'
 		--env 'FILE__PASSWORD=/run/secrets/webtop_password'
 		--env 'DISABLE_SUDO=true'
@@ -593,8 +608,9 @@ stop_desktop() {
 }
 
 wait_for_desktop() {
+	# The container always serves at its own root. Tailscale Serve owns the
+	# /desktop/ID mount point, so the backend never sees that prefix.
 	local id="$1" port="$2" username="$3" password="$4" path='/' attempt curl_user
-	if [[ "$(desktop_state_value "$id" '.desktop.access' ssh)" == tailscale ]]; then path="$(desktop_subfolder "$id")"; fi
 	curl_user="$username:$password"
 	curl_user="${curl_user//\\/\\\\}"
 	curl_user="${curl_user//\"/\\\"}"
@@ -618,11 +634,45 @@ enable_tailscale_desktop_route() {
 	tailscale serve --bg --https=443 --set-path="/desktop/$id" "https+insecure://127.0.0.1:$port"
 }
 
+tailscale_desktop_route_present() {
+	tailscale serve status 2>/dev/null | grep -Fq "/desktop/$1"
+}
+
 disable_tailscale_desktop_route() {
-	local id="$1" output
+	local id="$1"
 	command -v tailscale >/dev/null 2>&1 || return 1
-	output="$(tailscale serve --https=443 --set-path="/desktop/$id" off 2>&1)" && return 0
-	[[ "$output" == *'handler does not exist'* ]]
+	tailscale serve --https=443 --set-path="/desktop/$id" off >/dev/null 2>&1 && return 0
+	# Removing a route that is already gone is success. Confirm that against Serve's
+	# own state instead of matching an English error string upstream can reword.
+	! tailscale_desktop_route_present "$id"
+}
+
+# tailscale serve --bg returns 0 even when it only printed a consent URL, and the
+# loopback health check never traverses the proxy, so a broken tailnet route used to
+# look like a healthy desktop. Probe the real URL and say what is wrong.
+verify_tailscale_desktop_route() {
+	local id="$1" username="$2" password="$3" dns_name url body curl_user
+	dns_name="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')"
+	if [[ -z "$dns_name" ]]; then
+		printf 'Could not read this node name from Tailscale, so the web workspace URL was not verified.\n' >&2
+		return 1
+	fi
+	url="https://$dns_name$(desktop_subfolder "$id")"
+	curl_user="$username:$password"
+	curl_user="${curl_user//\\/\\\\}"
+	curl_user="${curl_user//\"/\\\"}"
+	body="$(printf 'user = "%s"\n' "$curl_user" | curl --config - --location --silent --show-error \
+		--max-time 15 "$url" 2>/dev/null || true)"
+	if [[ -z "$body" ]]; then
+		printf 'No response from %s yet. Tailscale may still be waiting for HTTPS or Serve consent; run: sudo tailscale serve status\n' "$url" >&2
+		return 1
+	fi
+	if grep -qi 'Welcome to nginx' <<< "$body"; then
+		printf 'The web workspace at %s is serving the default web server page instead of the desktop.\n' "$url" >&2
+		printf 'That means the proxy path and the container path disagree. Use --access ssh, or report this with: sudo tailscale serve status\n' >&2
+		return 1
+	fi
+	return 0
 }
 
 restore_desktop_access() {
@@ -741,6 +791,11 @@ enable_desktop() {
 	exec {desktop_lock_fd}>&-
 	say
 	say "Web workspace enabled for runner $id."
+	# Warn rather than fail: Tailscale can still be waiting on HTTPS or Serve consent,
+	# which is the administrator's action, not a broken workspace.
+	if [[ "$access" == tailscale ]]; then
+		verify_tailscale_desktop_route "$id" "$username" "$password" || true
+	fi
 	desktop_access_details "$id"
 }
 
